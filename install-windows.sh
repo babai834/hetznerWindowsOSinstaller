@@ -369,7 +369,12 @@ detect_boot_mode() {
 generate_password() {
     # Generate a secure random password if not provided
     if [ -z "${ADMIN_PASSWORD:-}" ]; then
-        ADMIN_PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%' < /dev/urandom | head -c 16)
+        ADMIN_PASSWORD=$(python3 - <<'PY'
+import secrets
+alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%'
+print(''.join(secrets.choice(alphabet) for _ in range(16)))
+PY
+)
         log_info "Generated administrator password: $ADMIN_PASSWORD"
     fi
 }
