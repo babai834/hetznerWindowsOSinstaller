@@ -33,13 +33,11 @@ echo -e "${NC}"
 # ─── Configuration ───────────────────────────────────────────────
 # Installer source URL.
 # Options:
-#   - GitHub raw URL:  https://raw.githubusercontent.com/YOU/REPO/main/install-windows.sh
-#   - Any direct URL:  https://your-domain.com/install-windows.sh
-#
-# Add a cache-busting query string so newly pushed installer changes are
-# fetched immediately instead of occasionally serving a stale CDN response.
-CACHE_BUSTER=$(date +%s)
-INSTALLER_URL="https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh?ts=${CACHE_BUSTER}"
+#   - GitHub contents API: https://api.github.com/repos/YOU/REPO/contents/install-windows.sh?ref=main
+#   - GitHub raw URL fallback: https://raw.githubusercontent.com/YOU/REPO/main/install-windows.sh
+#   - Any direct URL: https://your-domain.com/install-windows.sh
+INSTALLER_API_URL="https://api.github.com/repos/babai834/hetznerWindowsOSinstaller/contents/install-windows.sh?ref=main"
+INSTALLER_RAW_URL="https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh"
 # ─────────────────────────────────────────────────────────────────
 
 INSTALL_DIR="/root"
@@ -52,13 +50,50 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo -e "${GREEN}[1/3]${NC} Downloading installer..."
-if command -v wget &>/dev/null; then
-    wget -q --no-check-certificate -O "$INSTALLER_PATH" "$INSTALLER_URL"
-elif command -v curl &>/dev/null; then
-    curl -fsSL -k -o "$INSTALLER_PATH" "$INSTALLER_URL"
-else
+download_via_github_api() {
+    python3 - "$INSTALLER_PATH" "$INSTALLER_API_URL" <<'PY'
+import base64
+import json
+import sys
+import urllib.request
+
+output_path, api_url = sys.argv[1], sys.argv[2]
+request = urllib.request.Request(api_url, headers={"User-Agent": "hetzner-windows-installer-bootstrap"})
+with urllib.request.urlopen(request, timeout=30) as response:
+    payload = json.load(response)
+
+content = payload.get("content", "")
+if not content:
+    raise SystemExit("Missing content in GitHub API response")
+
+decoded = base64.b64decode(content)
+with open(output_path, "wb") as handle:
+    handle.write(decoded)
+PY
+}
+
+download_via_raw_url() {
+    if command -v wget &>/dev/null; then
+        wget -q --no-check-certificate -O "$INSTALLER_PATH" "$INSTALLER_RAW_URL"
+        return
+    fi
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL -k -o "$INSTALLER_PATH" "$INSTALLER_RAW_URL"
+        return
+    fi
+
     echo -e "${RED}[ERROR]${NC} Neither wget nor curl found."
     exit 1
+}
+
+if command -v python3 &>/dev/null; then
+    if ! download_via_github_api; then
+        echo -e "${CYAN}[INFO]${NC} GitHub API download failed, falling back to raw URL..."
+        download_via_raw_url
+    fi
+else
+    download_via_raw_url
 fi
 
 if [ ! -s "$INSTALLER_PATH" ]; then
