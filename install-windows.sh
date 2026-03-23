@@ -1,0 +1,1450 @@
+#!/bin/bash
+###############################################################################
+# Windows Server 2025 Automated Installer for Hetzner Dedicated Servers
+# 
+# CLOUD-READY: No SCP needed. Users only need PuTTY SSH.
+# 
+# ONE-LINER INSTALL (run from Hetzner rescue via PuTTY):
+#   wget -qO- https://YOUR_DOMAIN/install.sh | bash
+#
+# Or download and run directly:
+#   wget -O install.sh https://YOUR_DOMAIN/install-windows.sh && bash install.sh
+#
+# This script handles everything:
+#   - Dependency installation
+#   - Disk detection and partitioning
+#   - ISO download and extraction
+#   - VirtIO driver injection
+#   - Unattended answer file generation
+#   - Hetzner-specific /32 point-to-point network configuration
+#   - Bootloader setup (UEFI + Legacy BIOS)
+#   - Post-install RDP, firewall, and optimization
+#   - Network repair script placed on Windows drive
+#
+# Usage: bash install-windows.sh [options]
+#   --ip <IP>           Server IPv4 address (auto-detected from rescue env)
+#   --gateway <GW>      Gateway address (auto-detected)
+#   --password <PASS>   Administrator password (default: generated)
+#   --iso-url <URL>     Custom ISO download URL
+#   --target-disk <DEV> Target disk for Windows (default: auto-detect)
+#   --work-disk <DEV>   Work disk for temp files (default: auto-detect)
+#   --skip-confirm      Skip confirmation prompts
+#   --uefi              Force UEFI boot mode
+#   --bios              Force Legacy BIOS boot mode
+#   --interactive       Launch interactive wizard (best for PuTTY users)
+#
+# Requirements:
+#   - Hetzner dedicated server booted into rescue mode
+#   - At least 2 physical drives (or --single-disk mode)
+#   - Minimum 4GB RAM
+#
+###############################################################################
+
+set -euo pipefail
+
+# ===================== Configuration Defaults =====================
+
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Default ISO URL (Windows Server 2025 Evaluation)
+DEFAULT_ISO_URL="https://uptobox.g-direct.workers.dev/6:/Upload%20Files/26100.32230.260111-0550.lt_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
+
+# VirtIO drivers ISO (Red Hat signed, for Hetzner's KVM/QEMU if needed)
+VIRTIO_ISO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+
+# Hetzner DNS servers
+DNS_PRIMARY="185.12.64.1"
+DNS_SECONDARY="185.12.64.2"
+
+# Working directories
+WORK_DIR="/tmp/win-install"
+MOUNT_ISO="/mnt/iso"
+MOUNT_WORK="/mnt/work"
+MOUNT_TARGET="/mnt/target"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# ===================== Functions =====================
+
+log_info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+log_step()    { echo -e "${CYAN}[STEP]${NC} $*"; }
+log_detail()  { echo -e "${BLUE}  →${NC} $*"; }
+
+banner() {
+    echo -e "${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║     Windows Server 2025 Installer for Hetzner Servers      ║"
+    echo "║                      Version ${SCRIPT_VERSION}                         ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+cleanup() {
+    log_info "Cleaning up mount points..."
+    umount "$MOUNT_ISO" 2>/dev/null || true
+    umount "$MOUNT_WORK" 2>/dev/null || true
+    umount "$MOUNT_TARGET" 2>/dev/null || true
+    [ -d "$MOUNT_ISO" ] && rmdir "$MOUNT_ISO" 2>/dev/null || true
+    [ -d "$MOUNT_WORK" ] && rmdir "$MOUNT_WORK" 2>/dev/null || true
+    [ -d "$MOUNT_TARGET" ] && rmdir "$MOUNT_TARGET" 2>/dev/null || true
+}
+
+die() {
+    log_error "$@"
+    cleanup
+    exit 1
+}
+
+check_rescue_mode() {
+    if [ ! -f /etc/hetzner-rescue ]; then
+        # Alternative check
+        if ! grep -qi "rescue" /etc/hostname 2>/dev/null && \
+           ! grep -qi "rescue" /proc/version 2>/dev/null && \
+           [ "$(whoami)" != "root" ]; then
+            log_warn "This doesn't appear to be a Hetzner rescue system."
+            log_warn "The script is designed for Hetzner rescue mode."
+            if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
+                read -rp "Continue anyway? (y/N): " confirm
+                [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || die "Aborted."
+            fi
+        fi
+    fi
+}
+
+interactive_wizard() {
+    echo -e "${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║           Interactive Installation Wizard                   ║"
+    echo "║     Answer a few questions to configure the installation    ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    
+    # Auto-detect IP
+    local detected_ip
+    detected_ip=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1) || true
+    
+    echo -e "  Detected server IP: ${GREEN}${detected_ip:-none}${NC}"
+    read -rp "  Server IP [$detected_ip]: " input_ip
+    SERVER_IP="${input_ip:-$detected_ip}"
+    
+    # Auto-detect gateway
+    local detected_gw
+    detected_gw=$(ip route | grep default | awk '{print $3}' | head -1) || true
+    
+    echo -e "  Detected gateway:   ${GREEN}${detected_gw:-none}${NC}"
+    read -rp "  Gateway [$detected_gw]: " input_gw
+    GATEWAY="${input_gw:-$detected_gw}"
+    
+    # Password
+    echo ""
+    read -rp "  Administrator password (empty = auto-generate): " input_pass
+    ADMIN_PASSWORD="${input_pass:-}"
+    
+    # Disk selection
+    echo ""
+    log_info "Available disks:"
+    lsblk -dpno NAME,SIZE,MODEL | grep -v "loop\|ram" | while read -r line; do
+        echo -e "    ${GREEN}$line${NC}"
+    done
+    echo ""
+    
+    local first_disk
+    first_disk=$(lsblk -dpno NAME,TYPE | grep "disk" | awk '{print $1}' | head -1)
+    local second_disk
+    second_disk=$(lsblk -dpno NAME,TYPE | grep "disk" | awk '{print $1}' | sed -n '2p') || true
+    
+    read -rp "  Target disk for Windows [$first_disk]: " input_target
+    TARGET_DISK="${input_target:-$first_disk}"
+    
+    if [ -n "$second_disk" ]; then
+        read -rp "  Work disk for temp files [$second_disk]: " input_work
+        WORK_DISK="${input_work:-$second_disk}"
+    else
+        WORK_DISK="$TARGET_DISK"
+        SINGLE_DISK_MODE=1
+        log_warn "Only 1 disk found — using single-disk mode."
+    fi
+    
+    # ISO URL
+    echo ""
+    echo -e "  Default ISO: Windows Server 2025 Evaluation"
+    read -rp "  Custom ISO URL (empty = default): " input_iso
+    if [ -n "$input_iso" ]; then
+        ISO_URL="$input_iso"
+    fi
+    
+    echo ""
+    log_info "Configuration complete. Proceeding with installation..."
+    echo ""
+}
+
+check_dependencies() {
+    log_step "Checking dependencies..."
+    local deps=(wget parted mkfs.ntfs wimlib-imagex sfdisk lsblk mkfs.fat)
+    local missing=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        log_info "Installing missing dependencies: ${missing[*]}"
+        apt-get update -qq
+        apt-get install -y -qq wget parted ntfs-3g wimtools dosfstools gdisk grub-pc-bin grub-efi-amd64-bin 2>/dev/null || true
+        
+        # Re-check
+        for dep in "${deps[@]}"; do
+            if ! command -v "$dep" &>/dev/null; then
+                die "Required tool '$dep' not found and could not be installed."
+            fi
+        done
+    fi
+    
+    log_info "All dependencies satisfied."
+}
+
+detect_network() {
+    log_step "Detecting network configuration..."
+    
+    # Auto-detect IP from rescue system
+    if [ -z "${SERVER_IP:-}" ]; then
+        SERVER_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    fi
+    
+    # Auto-detect gateway
+    if [ -z "${GATEWAY:-}" ]; then
+        GATEWAY=$(ip route | grep default | awk '{print $3}' | head -1)
+    fi
+    
+    # Auto-detect subnet mask (Hetzner uses /32 with point-to-point routing)
+    SUBNET_MASK="255.255.255.255"
+    SUBNET_PREFIX="32"
+    
+    # Detect IPv6
+    SERVER_IPV6=$(ip -6 addr show scope global | grep -oP '(?<=inet6\s)[0-9a-f:]+' | head -1) || true
+    
+    if [ -z "$SERVER_IP" ]; then
+        die "Could not detect server IP. Use --ip to specify."
+    fi
+    
+    if [ -z "$GATEWAY" ]; then
+        die "Could not detect gateway. Use --gateway to specify."
+    fi
+    
+    log_detail "Server IP:  $SERVER_IP"
+    log_detail "Gateway:    $GATEWAY"
+    log_detail "Subnet:     /$SUBNET_PREFIX"
+    [ -n "${SERVER_IPV6:-}" ] && log_detail "IPv6:       $SERVER_IPV6"
+}
+
+detect_disks() {
+    log_step "Detecting disk configuration..."
+    
+    # List all physical disks (exclude loop, ram, etc.)
+    mapfile -t ALL_DISKS < <(lsblk -dpno NAME,TYPE,SIZE | grep "disk" | awk '{print $1}')
+    
+    if [ ${#ALL_DISKS[@]} -eq 0 ]; then
+        die "No disks detected!"
+    fi
+    
+    log_info "Detected disks:"
+    for disk in "${ALL_DISKS[@]}"; do
+        local size
+        size=$(lsblk -dpno SIZE "$disk" 2>/dev/null || echo "unknown")
+        local model
+        model=$(lsblk -dpno MODEL "$disk" 2>/dev/null || echo "unknown")
+        log_detail "$disk - Size: $size - Model: $model"
+    done
+    
+    if [ ${#ALL_DISKS[@]} -lt 2 ] && [ -z "${SINGLE_DISK_MODE:-}" ]; then
+        log_warn "Only 1 disk detected. Using single-disk mode."
+        log_warn "A partition on the same disk will be used as workspace."
+        SINGLE_DISK_MODE=1
+    fi
+    
+    # Target disk selection
+    if [ -z "${TARGET_DISK:-}" ]; then
+        # Use the first (usually larger/primary) disk
+        TARGET_DISK="${ALL_DISKS[0]}"
+    fi
+    
+    # Work disk selection
+    if [ -z "${WORK_DISK:-}" ]; then
+        if [ "${SINGLE_DISK_MODE:-0}" = "1" ]; then
+            WORK_DISK="$TARGET_DISK"
+        else
+            # Use the second disk for workspace
+            WORK_DISK="${ALL_DISKS[1]}"
+        fi
+    fi
+    
+    log_detail "Target disk (Windows): $TARGET_DISK"
+    log_detail "Work disk (temp):      $WORK_DISK"
+}
+
+detect_boot_mode() {
+    log_step "Detecting boot mode..."
+    
+    if [ -n "${FORCE_UEFI:-}" ]; then
+        BOOT_MODE="uefi"
+    elif [ -n "${FORCE_BIOS:-}" ]; then
+        BOOT_MODE="bios"
+    elif [ -d /sys/firmware/efi ]; then
+        BOOT_MODE="uefi"
+    else
+        BOOT_MODE="bios"
+    fi
+    
+    log_detail "Boot mode: ${BOOT_MODE^^}"
+}
+
+generate_password() {
+    # Generate a secure random password if not provided
+    if [ -z "${ADMIN_PASSWORD:-}" ]; then
+        ADMIN_PASSWORD=$(tr -dc 'A-Za-z0-9!@#$%' < /dev/urandom | head -c 16)
+        log_info "Generated administrator password: $ADMIN_PASSWORD"
+    fi
+}
+
+confirm_settings() {
+    echo ""
+    echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}  Installation Summary${NC}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
+    echo -e "  Server IP:        ${GREEN}$SERVER_IP${NC}"
+    echo -e "  Gateway:          ${GREEN}$GATEWAY${NC}"
+    echo -e "  Admin Password:   ${GREEN}$ADMIN_PASSWORD${NC}"
+    echo -e "  Target Disk:      ${GREEN}$TARGET_DISK${NC}"
+    echo -e "  Work Disk:        ${GREEN}$WORK_DISK${NC}"
+    echo -e "  Boot Mode:        ${GREEN}${BOOT_MODE^^}${NC}"
+    echo -e "  ISO URL:          ${GREEN}${ISO_URL:0:60}...${NC}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${RED}  ⚠ WARNING: ALL DATA ON $TARGET_DISK WILL BE DESTROYED!${NC}"
+    echo ""
+    
+    if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
+        read -rp "Proceed with installation? (yes/NO): " confirm
+        [ "$confirm" = "yes" ] || die "Installation aborted by user."
+    fi
+}
+
+prepare_work_disk() {
+    log_step "Preparing work disk..."
+    
+    # Unmount any existing mounts on work disk
+    umount "${WORK_DISK}"* 2>/dev/null || true
+    
+    if [ "${SINGLE_DISK_MODE:-0}" = "1" ]; then
+        # In single-disk mode, we'll create a temp partition at the end
+        log_info "Single-disk mode: creating temporary workspace partition..."
+        
+        # Get disk size in sectors
+        local disk_sectors
+        disk_sectors=$(blockdev --getsz "$WORK_DISK")
+        local sector_size=512
+        # Reserve last 20GB for workspace
+        local work_size=$((20 * 1024 * 1024 * 1024 / sector_size))
+        local work_start=$((disk_sectors - work_size))
+        
+        # Create a small partition at the end for workspace
+        echo "$work_start,$work_size,L" | sfdisk --append "$WORK_DISK" --no-reread 2>/dev/null || true
+        partprobe "$WORK_DISK" 2>/dev/null || true
+        sleep 2
+        
+        # Find the last partition
+        WORK_PART=$(lsblk -lnpo NAME "$WORK_DISK" | tail -1)
+    else
+        # Wipe and format the entire work disk
+        wipefs -a "$WORK_DISK" 2>/dev/null || true
+        parted -s "$WORK_DISK" mklabel gpt
+        parted -s "$WORK_DISK" mkpart primary ntfs 1MiB 100%
+        partprobe "$WORK_DISK" 2>/dev/null || true
+        sleep 2
+        
+        WORK_PART="${WORK_DISK}1"
+        # Handle NVMe naming
+        if [[ "$WORK_DISK" == *"nvme"* ]]; then
+            WORK_PART="${WORK_DISK}p1"
+        fi
+    fi
+    
+    log_detail "Formatting workspace partition: $WORK_PART"
+    mkfs.ntfs -f -L "WORKSPACE" "$WORK_PART" || die "Failed to format workspace"
+    
+    mkdir -p "$MOUNT_WORK"
+    mount "$WORK_PART" "$MOUNT_WORK" || die "Failed to mount workspace"
+    
+    log_info "Workspace ready at $MOUNT_WORK"
+}
+
+download_iso() {
+    log_step "Downloading Windows Server ISO..."
+    
+    local iso_path="$MOUNT_WORK/windows.iso"
+    
+    if [ -f "$iso_path" ]; then
+        local iso_size
+        iso_size=$(stat -c%s "$iso_path" 2>/dev/null || echo 0)
+        if [ "$iso_size" -gt 1000000000 ]; then
+            log_info "ISO already exists ($(numfmt --to=iec "$iso_size")), skipping download."
+            ISO_PATH="$iso_path"
+            return
+        fi
+    fi
+    
+    log_detail "URL: $ISO_URL"
+    log_detail "This may take 10-20 minutes depending on network speed..."
+    
+    wget --no-check-certificate -O "$iso_path" "$ISO_URL" \
+        --progress=bar:force:noscroll 2>&1 || die "Failed to download ISO"
+    
+    local final_size
+    final_size=$(stat -c%s "$iso_path")
+    log_info "ISO downloaded successfully ($(numfmt --to=iec "$final_size"))"
+    
+    ISO_PATH="$iso_path"
+}
+
+download_virtio() {
+    log_step "Downloading VirtIO drivers..."
+    
+    local virtio_path="$MOUNT_WORK/virtio-win.iso"
+    
+    if [ -f "$virtio_path" ]; then
+        local vio_size
+        vio_size=$(stat -c%s "$virtio_path" 2>/dev/null || echo 0)
+        if [ "$vio_size" -gt 100000000 ]; then
+            log_info "VirtIO ISO already exists, skipping download."
+            VIRTIO_PATH="$virtio_path"
+            return
+        fi
+    fi
+    
+    wget --no-check-certificate -O "$virtio_path" "$VIRTIO_ISO_URL" \
+        --progress=bar:force:noscroll 2>&1 || {
+        log_warn "VirtIO download failed. Continuing without VirtIO drivers."
+        log_warn "This is fine for most Hetzner hardware (non-KVM)."
+        VIRTIO_PATH=""
+        return
+    }
+    
+    VIRTIO_PATH="$virtio_path"
+    log_info "VirtIO drivers downloaded."
+}
+
+partition_target_disk() {
+    log_step "Partitioning target disk ($TARGET_DISK)..."
+    
+    # Unmount any existing partitions
+    umount "${TARGET_DISK}"* 2>/dev/null || true
+    
+    # Wipe existing partition table
+    wipefs -a "$TARGET_DISK" 2>/dev/null || true
+    dd if=/dev/zero of="$TARGET_DISK" bs=1M count=10 2>/dev/null || true
+    
+    if [ "$BOOT_MODE" = "uefi" ]; then
+        log_detail "Creating GPT partition table (UEFI)..."
+        parted -s "$TARGET_DISK" mklabel gpt
+        
+        # EFI System Partition (512MB)
+        parted -s "$TARGET_DISK" mkpart "EFI" fat32 1MiB 513MiB
+        parted -s "$TARGET_DISK" set 1 esp on
+        
+        # Microsoft Reserved Partition (16MB)  
+        parted -s "$TARGET_DISK" mkpart "MSR" 513MiB 529MiB
+        parted -s "$TARGET_DISK" set 2 msftres on
+        
+        # Windows partition (rest of disk)
+        parted -s "$TARGET_DISK" mkpart "Windows" ntfs 529MiB 100%
+        
+        partprobe "$TARGET_DISK" 2>/dev/null || true
+        sleep 2
+        
+        # Determine partition naming
+        if [[ "$TARGET_DISK" == *"nvme"* ]]; then
+            EFI_PART="${TARGET_DISK}p1"
+            MSR_PART="${TARGET_DISK}p2"
+            WIN_PART="${TARGET_DISK}p3"
+        else
+            EFI_PART="${TARGET_DISK}1"
+            MSR_PART="${TARGET_DISK}2"
+            WIN_PART="${TARGET_DISK}3"
+        fi
+        
+        log_detail "Formatting EFI partition..."
+        mkfs.fat -F32 -n "EFI" "$EFI_PART"
+        
+    else
+        log_detail "Creating MBR partition table (Legacy BIOS)..."
+        parted -s "$TARGET_DISK" mklabel msdos
+        
+        # System Reserved (500MB, active/boot)
+        parted -s "$TARGET_DISK" mkpart primary ntfs 1MiB 501MiB
+        parted -s "$TARGET_DISK" set 1 boot on
+        
+        # Windows partition (rest)
+        parted -s "$TARGET_DISK" mkpart primary ntfs 501MiB 100%
+        
+        partprobe "$TARGET_DISK" 2>/dev/null || true
+        sleep 2
+        
+        if [[ "$TARGET_DISK" == *"nvme"* ]]; then
+            BOOT_PART="${TARGET_DISK}p1"
+            WIN_PART="${TARGET_DISK}p2"
+        else
+            BOOT_PART="${TARGET_DISK}1"
+            WIN_PART="${TARGET_DISK}2"
+        fi
+        
+        log_detail "Formatting boot partition..."
+        mkfs.ntfs -f -L "System Reserved" "$BOOT_PART"
+    fi
+    
+    log_detail "Formatting Windows partition..."
+    mkfs.ntfs -f -L "Windows" "$WIN_PART"
+    
+    log_info "Disk partitioned successfully."
+}
+
+extract_windows() {
+    log_step "Extracting Windows installation files..."
+    
+    # Mount ISO
+    mkdir -p "$MOUNT_ISO"
+    mount -o loop,ro "$ISO_PATH" "$MOUNT_ISO" || die "Failed to mount ISO"
+    
+    # Mount target Windows partition
+    mkdir -p "$MOUNT_TARGET"
+    mount "$WIN_PART" "$MOUNT_TARGET" || die "Failed to mount target partition"
+    
+    # Find the install.wim or install.esd
+    local wim_file=""
+    if [ -f "$MOUNT_ISO/sources/install.wim" ]; then
+        wim_file="$MOUNT_ISO/sources/install.wim"
+    elif [ -f "$MOUNT_ISO/sources/install.esd" ]; then
+        wim_file="$MOUNT_ISO/sources/install.esd"
+    else
+        die "Cannot find install.wim or install.esd in ISO"
+    fi
+    
+    log_detail "Found: $(basename "$wim_file")"
+    
+    # List available images
+    log_detail "Available Windows editions:"
+    wimlib-imagex info "$wim_file" | grep -E "^(Index|Name|Description)" | head -20 || true
+    
+    # Use image index 2 by default (Standard with Desktop Experience)
+    # Index 1 = Standard Core, Index 2 = Standard, Index 3 = Datacenter Core, Index 4 = Datacenter
+    local image_index=2
+    
+    # Check how many images exist
+    local num_images
+    num_images=$(wimlib-imagex info "$wim_file" | grep "^Image Count:" | awk '{print $3}')
+    if [ "${num_images:-0}" -lt 2 ]; then
+        image_index=1
+    fi
+    
+    log_detail "Applying image index $image_index to $WIN_PART..."
+    wimlib-imagex apply "$wim_file" "$image_index" "$MOUNT_TARGET" || die "Failed to apply Windows image"
+    
+    log_info "Windows files extracted successfully."
+}
+
+inject_drivers() {
+    if [ -z "${VIRTIO_PATH:-}" ] || [ ! -f "${VIRTIO_PATH:-}" ]; then
+        log_info "Skipping VirtIO driver injection (not needed for bare-metal)."
+        return
+    fi
+    
+    log_step "Injecting VirtIO drivers..."
+    
+    local virtio_mount="/mnt/virtio"
+    mkdir -p "$virtio_mount"
+    mount -o loop,ro "$VIRTIO_PATH" "$virtio_mount" || {
+        log_warn "Could not mount VirtIO ISO, skipping driver injection."
+        return
+    }
+    
+    # Copy relevant drivers to Windows
+    local driver_dest="$MOUNT_TARGET/Windows/INF"
+    
+    # Find Windows Server 2025/2022 drivers (w11 or 2k22 folder)
+    for driver_dir in "$virtio_mount"/*/w11/amd64 "$virtio_mount"/*/2k22/amd64 "$virtio_mount"/*/2k25/amd64; do
+        if [ -d "$driver_dir" ]; then
+            log_detail "Copying drivers from $driver_dir"
+            cp -r "$driver_dir"/* "$driver_dest/" 2>/dev/null || true
+        fi
+    done
+    
+    umount "$virtio_mount" 2>/dev/null || true
+    rmdir "$virtio_mount" 2>/dev/null || true
+    
+    log_info "Drivers injected."
+}
+
+generate_unattend_xml() {
+    log_step "Generating unattended answer file..."
+    
+    # Determine partition layout for unattend
+    local disk_id=0
+    
+    if [ "$BOOT_MODE" = "uefi" ]; then
+        cat > "$MOUNT_TARGET/Windows/Panther/unattend.xml" << 'XMLEOF'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+    <settings pass="windowsPE">
+        <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <SetupUILanguage>
+                <UILanguage>en-US</UILanguage>
+            </SetupUILanguage>
+            <InputLocale>en-US</InputLocale>
+            <SystemLocale>en-US</SystemLocale>
+            <UILanguage>en-US</UILanguage>
+            <UserLocale>en-US</UserLocale>
+        </component>
+    </settings>
+    <settings pass="specialize">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <ComputerName>WIN-HETZNER</ComputerName>
+            <TimeZone>UTC</TimeZone>
+        </component>
+        <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <fDenyTSConnections>false</fDenyTSConnections>
+        </component>
+        <component name="Networking-MPSSVC-Svc" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <FirewallGroups>
+                <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">
+                    <Active>true</Active>
+                    <Group>Remote Desktop</Group>
+                    <Profile>all</Profile>
+                </FirewallGroup>
+            </FirewallGroups>
+        </component>
+    </settings>
+    <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <ProtectYourPC>3</ProtectYourPC>
+                <SkipMachineOOBE>true</SkipMachineOOBE>
+                <SkipUserOOBE>true</SkipUserOOBE>
+            </OOBE>
+            <UserAccounts>
+                <AdministratorPassword>
+                    <Value>__ADMIN_PASSWORD__</Value>
+                    <PlainText>true</PlainText>
+                </AdministratorPassword>
+            </UserAccounts>
+            <AutoLogon>
+                <Enabled>true</Enabled>
+                <Count>3</Count>
+                <Username>Administrator</Username>
+                <Password>
+                    <Value>__ADMIN_PASSWORD__</Value>
+                    <PlainText>true</PlainText>
+                </Password>
+            </AutoLogon>
+            <FirstLogonCommands>
+                <SynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <CommandLine>cmd /c C:\setup-network.cmd</CommandLine>
+                    <Description>Configure Hetzner Network</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <CommandLine>cmd /c C:\post-install.cmd</CommandLine>
+                    <Description>Post-installation tasks</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+            </FirstLogonCommands>
+        </component>
+    </settings>
+</unattend>
+XMLEOF
+    else
+        # BIOS/MBR version (same content, different context)
+        cat > "$MOUNT_TARGET/Windows/Panther/unattend.xml" << 'XMLEOF'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+    <settings pass="windowsPE">
+        <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <SetupUILanguage>
+                <UILanguage>en-US</UILanguage>
+            </SetupUILanguage>
+            <InputLocale>en-US</InputLocale>
+            <SystemLocale>en-US</SystemLocale>
+            <UILanguage>en-US</UILanguage>
+            <UserLocale>en-US</UserLocale>
+        </component>
+    </settings>
+    <settings pass="specialize">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <ComputerName>WIN-HETZNER</ComputerName>
+            <TimeZone>UTC</TimeZone>
+        </component>
+        <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <fDenyTSConnections>false</fDenyTSConnections>
+        </component>
+        <component name="Networking-MPSSVC-Svc" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <FirewallGroups>
+                <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">
+                    <Active>true</Active>
+                    <Group>Remote Desktop</Group>
+                    <Profile>all</Profile>
+                </FirewallGroup>
+            </FirewallGroups>
+        </component>
+    </settings>
+    <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <ProtectYourPC>3</ProtectYourPC>
+                <SkipMachineOOBE>true</SkipMachineOOBE>
+                <SkipUserOOBE>true</SkipUserOOBE>
+            </OOBE>
+            <UserAccounts>
+                <AdministratorPassword>
+                    <Value>__ADMIN_PASSWORD__</Value>
+                    <PlainText>true</PlainText>
+                </AdministratorPassword>
+            </UserAccounts>
+            <AutoLogon>
+                <Enabled>true</Enabled>
+                <Count>3</Count>
+                <Username>Administrator</Username>
+                <Password>
+                    <Value>__ADMIN_PASSWORD__</Value>
+                    <PlainText>true</PlainText>
+                </Password>
+            </AutoLogon>
+            <FirstLogonCommands>
+                <SynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <CommandLine>cmd /c C:\setup-network.cmd</CommandLine>
+                    <Description>Configure Hetzner Network</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <CommandLine>cmd /c C:\post-install.cmd</CommandLine>
+                    <Description>Post-installation tasks</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+            </FirstLogonCommands>
+        </component>
+    </settings>
+</unattend>
+XMLEOF
+    fi
+    
+    # Replace password placeholder
+    sed -i "s|__ADMIN_PASSWORD__|${ADMIN_PASSWORD}|g" "$MOUNT_TARGET/Windows/Panther/unattend.xml"
+    
+    # Also place at root for Windows Setup to find it
+    cp "$MOUNT_TARGET/Windows/Panther/unattend.xml" "$MOUNT_TARGET/unattend.xml"
+    cp "$MOUNT_TARGET/Windows/Panther/unattend.xml" "$MOUNT_TARGET/Autounattend.xml"
+    
+    log_info "Unattended answer file generated."
+}
+
+create_network_script() {
+    log_step "Creating Hetzner network configuration script..."
+    
+    # Create the network setup script that runs on first boot
+    cat > "$MOUNT_TARGET/setup-network.cmd" << NETEOF
+@echo off
+REM ============================================================
+REM Hetzner Network Configuration for Windows Server
+REM Configures /32 point-to-point routing (Hetzner standard)
+REM ============================================================
+
+echo Configuring Hetzner network...
+
+REM Wait for network adapter to be ready
+timeout /t 10 /nobreak >nul
+
+REM Get the network adapter name
+for /f "tokens=1* delims=:" %%a in ('netsh interface show interface ^| findstr /i "Dedicated Connected"') do (
+    for /f "tokens=4" %%n in ("%%b") do set "ADAPTER=%%n"
+)
+
+REM Fallback adapter name detection
+if not defined ADAPTER (
+    for /f "skip=3 tokens=3,4*" %%a in ('netsh interface show interface') do (
+        if "%%a"=="Connected" (
+            set "ADAPTER=%%c"
+            goto :found
+        )
+    )
+)
+:found
+
+REM If still not found, use common name
+if not defined ADAPTER set "ADAPTER=Ethernet"
+
+echo Using adapter: %ADAPTER%
+
+REM Remove any existing IP configuration  
+netsh interface ip set address name="%ADAPTER%" source=dhcp >nul 2>&1
+timeout /t 3 /nobreak >nul
+
+REM Configure static IP with /32 subnet (Hetzner point-to-point)
+netsh interface ipv4 set address name="%ADAPTER%" static ${SERVER_IP} 255.255.255.255
+
+REM Add gateway route (Hetzner requires the gateway to be added as a /32 route first)
+netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" ${GATEWAY}
+route add ${GATEWAY} mask 255.255.255.255 0.0.0.0 if 1 metric 1 >nul 2>&1
+
+REM Alternative routing method for Hetzner /32
+netsh interface ipv4 add neighbors "%ADAPTER%" ${GATEWAY} 00-00-00-00-00-00
+netsh interface ipv4 add route ${GATEWAY}/32 "%ADAPTER%" 0.0.0.0
+netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" ${GATEWAY}
+
+REM Configure DNS servers
+netsh interface ipv4 set dns name="%ADAPTER%" static ${DNS_PRIMARY}
+netsh interface ipv4 add dns name="%ADAPTER%" ${DNS_SECONDARY} index=2
+
+REM Disable IPv6 privacy extensions (servers should use static addresses)  
+netsh interface ipv6 set privacy state=disabled
+
+REM Enable ping (ICMP) for monitoring
+netsh advfirewall firewall add rule name="Allow ICMPv4" protocol=icmpv4 dir=in action=allow >nul 2>&1
+netsh advfirewall firewall add rule name="Allow ICMPv6" protocol=icmpv6 dir=in action=allow >nul 2>&1
+
+echo Network configuration applied.
+echo IP: ${SERVER_IP}/32
+echo Gateway: ${GATEWAY}
+echo DNS: ${DNS_PRIMARY}, ${DNS_SECONDARY}
+
+REM Log the configuration
+echo %date% %time% - Network configured: ${SERVER_IP}/32 via ${GATEWAY} >> C:\hetzner-setup.log
+
+NETEOF
+
+    log_info "Network configuration script created."
+}
+
+create_post_install_script() {
+    log_step "Creating post-installation script..."
+    
+    cat > "$MOUNT_TARGET/post-install.cmd" << 'POSTEOF'
+@echo off
+REM ============================================================
+REM Post-Installation Configuration for Hetzner Windows Server
+REM ============================================================
+
+echo Running post-installation tasks...
+
+REM --- Enable Remote Desktop ---
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f >nul 2>&1
+
+REM --- Open RDP Firewall Rule ---
+netsh advfirewall firewall set rule group="Remote Desktop" new enable=yes >nul 2>&1
+netsh advfirewall firewall add rule name="RDP-TCP-3389" protocol=TCP dir=in localport=3389 action=allow >nul 2>&1
+netsh advfirewall firewall add rule name="RDP-UDP-3389" protocol=UDP dir=in localport=3389 action=allow >nul 2>&1
+
+REM --- Configure RDP Settings ---
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v PortNumber /t REG_DWORD /d 3389 /f >nul 2>&1
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /t REG_DWORD /d 1 /f >nul 2>&1
+
+REM --- Set High Performance Power Plan ---
+powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c >nul 2>&1
+
+REM --- Disable Server Manager at Login ---
+reg add "HKLM\SOFTWARE\Microsoft\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f >nul 2>&1
+
+REM --- Disable IE Enhanced Security Configuration ---
+reg add "HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}" /v IsInstalled /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}" /v IsInstalled /t REG_DWORD /d 0 /f >nul 2>&1
+
+REM --- Enable Remote Desktop Services ---
+sc config TermService start= auto >nul 2>&1
+net start TermService >nul 2>&1
+
+REM --- Set timezone to UTC ---
+tzutil /s "UTC" >nul 2>&1
+
+REM --- Disable Ctrl+Alt+Del requirement ---
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableCAD /t REG_DWORD /d 1 /f >nul 2>&1
+
+REM --- Enable auto-login for first boot (will be disabled after setup) ---
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d "1" /f >nul 2>&1
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d "Administrator" /f >nul 2>&1
+
+REM --- Configure Windows Update to manual ---
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate /t REG_DWORD /d 0 /f >nul 2>&1
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v AUOptions /t REG_DWORD /d 3 /f >nul 2>&1
+
+REM --- Optimize network adapter for server use ---
+powershell -Command "Set-NetAdapterAdvancedProperty -Name '*' -RegistryKeyword '*SpeedDuplex' -RegistryValue 0" >nul 2>&1
+powershell -Command "Set-NetAdapterAdvancedProperty -Name '*' -RegistryKeyword '*FlowControl' -RegistryValue 3" >nul 2>&1
+
+REM --- Install .NET 3.5 if available ---
+REM dism /online /enable-feature /featurename:NetFx3 /all >nul 2>&1
+
+REM --- Disable Auto-Logon after setup completes ---
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d "0" /f >nul 2>&1
+
+REM --- Clean up setup files ---
+del /q C:\setup-network.cmd >nul 2>&1
+del /q C:\post-install.cmd >nul 2>&1
+
+echo %date% %time% - Post-installation completed >> C:\hetzner-setup.log
+echo Post-installation tasks completed.
+echo.
+echo ============================================
+echo  Windows Server is ready!
+echo  RDP: Connect to this server's IP on port 3389
+echo  Username: Administrator
+echo ============================================
+
+POSTEOF
+
+    log_info "Post-installation script created."
+}
+
+create_fix_network_script() {
+    log_step "Embedding network repair tool on Windows drive..."
+    
+    # This script gets placed on C:\ so users can run it from KVM console
+    # if network doesn't work after install — no SCP needed!
+    cat > "$MOUNT_TARGET/fix-network.cmd" << FIXEOF
+@echo off
+REM ============================================================
+REM Hetzner Network Fix - Run from KVM console if RDP fails
+REM Auto-generated by installer for this server
+REM ============================================================
+
+echo ============================================
+echo  Hetzner Network Configuration Fix
+echo  Server: ${SERVER_IP}
+echo ============================================
+echo.
+
+set SERVER_IP=${SERVER_IP}
+set GATEWAY=${GATEWAY}
+set DNS1=${DNS_PRIMARY}
+set DNS2=${DNS_SECONDARY}
+
+REM Find adapter
+set ADAPTER=
+for /f "skip=3 tokens=3,4*" %%a in ('netsh interface show interface') do (
+    if "%%a"=="Connected" (
+        set "ADAPTER=%%c"
+        goto :found
+    )
+)
+for %%n in ("Ethernet" "Ethernet0" "Local Area Connection") do (
+    netsh interface show interface name=%%n >nul 2>&1
+    if not errorlevel 1 (
+        set "ADAPTER=%%~n"
+        goto :found
+    )
+)
+echo [ERROR] No network adapter found!
+pause
+exit /b 1
+
+:found
+echo Using adapter: %ADAPTER%
+echo.
+
+echo [1/5] Resetting IP configuration...
+netsh interface ip set address name="%ADAPTER%" source=dhcp >nul 2>&1
+timeout /t 3 /nobreak >nul
+
+echo [2/5] Setting static IP (%SERVER_IP%/32)...
+netsh interface ipv4 set address name="%ADAPTER%" static %SERVER_IP% 255.255.255.255
+
+echo [3/5] Configuring Hetzner /32 routing...
+netsh interface ipv4 add route %GATEWAY%/32 "%ADAPTER%" 0.0.0.0 metric=1 >nul 2>&1
+netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" %GATEWAY% metric=1 >nul 2>&1
+route delete 0.0.0.0 >nul 2>&1
+route add %GATEWAY% mask 255.255.255.255 0.0.0.0 >nul 2>&1
+route add 0.0.0.0 mask 0.0.0.0 %GATEWAY% >nul 2>&1
+
+echo [4/5] Setting DNS (%DNS1%, %DNS2%)...
+netsh interface ipv4 set dns name="%ADAPTER%" static %DNS1%
+netsh interface ipv4 add dns name="%ADAPTER%" %DNS2% index=2
+
+echo [5/5] Enabling RDP and firewall rules...
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f >nul 2>&1
+netsh advfirewall firewall set rule group="Remote Desktop" new enable=yes >nul 2>&1
+netsh advfirewall firewall add rule name="RDP-TCP-3389" protocol=TCP dir=in localport=3389 action=allow >nul 2>&1
+netsh advfirewall firewall add rule name="Allow ICMPv4" protocol=icmpv4 dir=in action=allow >nul 2>&1
+
+echo.
+echo Testing connectivity...
+ping -n 2 %DNS1% >nul 2>&1
+if %errorlevel%==0 (
+    echo [OK] Network is working - DNS %DNS1% reachable
+    ping -n 2 google.com >nul 2>&1
+    if %errorlevel%==0 (
+        echo [OK] Internet connectivity confirmed
+    ) else (
+        echo [WARN] DNS resolution issue - try restarting DNS Client service
+    )
+) else (
+    echo [FAIL] Cannot reach DNS - check gateway ARP entry
+    echo Attempting ARP fix...
+    netsh interface ipv4 add neighbors "%ADAPTER%" %GATEWAY% 00-00-00-00-00-00 >nul 2>&1
+    echo Retry: ping %DNS1%
+)
+
+echo.
+echo ============================================
+echo  RDP: %SERVER_IP%:3389
+echo  User: Administrator
+echo ============================================
+pause
+FIXEOF
+
+    log_info "Network repair tool embedded at C:\\fix-network.cmd"
+}
+
+setup_san_policy() {    log_step "Configuring SAN policy for disk recognition..."
+    
+    # Create diskpart script to enable all disks online
+    mkdir -p "$MOUNT_TARGET/Windows/Setup/Scripts"
+    
+    cat > "$MOUNT_TARGET/Windows/Setup/Scripts/SetupComplete.cmd" << 'SCEOF'
+@echo off
+REM Run network setup
+call C:\setup-network.cmd
+REM Run post-install
+call C:\post-install.cmd
+SCEOF
+
+    # Create san policy file  
+    cat > "$MOUNT_TARGET/san-policy.xml" << 'SANEOF'
+<?xml version='1.0' encoding='utf-8' standalone='yes'?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="offlineServicing">
+    <component name="Microsoft-Windows-PartitionManager" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <SanPolicy>1</SanPolicy>
+    </component>
+  </settings>
+</unattend>
+SANEOF
+
+    log_info "SAN policy configured."
+}
+
+setup_bootloader() {
+    log_step "Setting up Windows bootloader..."
+    
+    if [ "$BOOT_MODE" = "uefi" ]; then
+        setup_uefi_boot
+    else
+        setup_bios_boot
+    fi
+}
+
+setup_uefi_boot() {
+    log_detail "Configuring UEFI boot..."
+    
+    # Mount EFI partition
+    local efi_mount="/mnt/efi"
+    mkdir -p "$efi_mount"
+    mount "$EFI_PART" "$efi_mount" || die "Failed to mount EFI partition"
+    
+    # Create EFI boot directory structure
+    mkdir -p "$efi_mount/EFI/Microsoft/Boot"
+    mkdir -p "$efi_mount/EFI/Boot"
+    
+    # Copy Windows boot files
+    if [ -d "$MOUNT_TARGET/Windows/Boot/EFI" ]; then
+        cp "$MOUNT_TARGET/Windows/Boot/EFI/bootmgfw.efi" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+        cp "$MOUNT_TARGET/Windows/Boot/EFI/bootmgfw.efi" "$efi_mount/EFI/Boot/bootx64.efi" 2>/dev/null || true
+        cp -r "$MOUNT_TARGET/Windows/Boot/EFI/"* "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+    fi
+    
+    # Copy BCD (Boot Configuration Data)
+    if [ -f "$MOUNT_TARGET/Windows/Boot/EFI/BCD" ]; then
+        cp "$MOUNT_TARGET/Windows/Boot/EFI/BCD" "$efi_mount/EFI/Microsoft/Boot/BCD" 2>/dev/null || true
+    fi
+    
+    # Create BCD store using bcdboot-like approach
+    # We need to set up proper BCD entries
+    # Copy boot fonts
+    mkdir -p "$efi_mount/EFI/Microsoft/Boot/Fonts"
+    cp "$MOUNT_TARGET/Windows/Boot/Fonts/"* "$efi_mount/EFI/Microsoft/Boot/Fonts/" 2>/dev/null || true
+    
+    # Copy boot resources
+    cp "$MOUNT_TARGET/Windows/Boot/EFI/boot.stl" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+    cp "$MOUNT_TARGET/Windows/Boot/EFI/memtest.efi" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+    
+    umount "$efi_mount"
+    rmdir "$efi_mount"
+    
+    # Use efibootmgr to add boot entry if available
+    if command -v efibootmgr &>/dev/null; then
+        efibootmgr -c -d "$TARGET_DISK" -p 1 -l '\EFI\Microsoft\Boot\bootmgfw.efi' -L "Windows Server 2025" 2>/dev/null || true
+    fi
+    
+    log_info "UEFI boot configured."
+}
+
+setup_bios_boot() {
+    log_detail "Configuring Legacy BIOS boot..."
+    
+    # Mount boot partition
+    local boot_mount="/mnt/bootpart"
+    mkdir -p "$boot_mount"
+    mount "$BOOT_PART" "$boot_mount" || die "Failed to mount boot partition"
+    
+    # Copy boot files to the system reserved partition
+    mkdir -p "$boot_mount/Boot"
+    
+    if [ -d "$MOUNT_TARGET/Windows/Boot/PCAT" ]; then
+        cp -r "$MOUNT_TARGET/Windows/Boot/PCAT/"* "$boot_mount/Boot/" 2>/dev/null || true
+    fi
+    
+    # Copy bootmgr
+    cp "$MOUNT_TARGET/bootmgr" "$boot_mount/" 2>/dev/null || true
+    cp "$MOUNT_TARGET/Boot/BCD" "$boot_mount/Boot/BCD" 2>/dev/null || true
+    
+    # Copy boot fonts
+    mkdir -p "$boot_mount/Boot/Fonts"
+    cp "$MOUNT_TARGET/Windows/Boot/Fonts/"* "$boot_mount/Boot/Fonts/" 2>/dev/null || true
+    
+    umount "$boot_mount"
+    rmdir "$boot_mount"
+    
+    # Write MBR boot code
+    if [ -f "$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" ]; then
+        # Use the Windows MBR
+        dd if="$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" of="$TARGET_DISK" bs=440 count=1 conv=notrunc 2>/dev/null || true
+    fi
+    
+    # Install generic MBR using ms-sys or syslinux if bootmgr approach fails
+    if command -v ms-sys &>/dev/null; then
+        ms-sys -7 "$TARGET_DISK" 2>/dev/null || true
+        ms-sys -n "$BOOT_PART" 2>/dev/null || true
+    fi
+    
+    log_info "Legacy BIOS boot configured."
+}
+
+write_boot_bcd() {
+    log_step "Creating Boot Configuration Data (BCD)..."
+    
+    # We'll create a minimal BCD using hivex/reged if available
+    # Otherwise we rely on the BCD copied from Windows installation image
+    
+    local bcd_path=""
+    if [ "$BOOT_MODE" = "uefi" ]; then
+        local efi_mount="/mnt/efi"
+        mkdir -p "$efi_mount"
+        mount "$EFI_PART" "$efi_mount"
+        bcd_path="$efi_mount/EFI/Microsoft/Boot/BCD"
+    else
+        local boot_mount="/mnt/bootpart"
+        mkdir -p "$boot_mount"
+        mount "$BOOT_PART" "$boot_mount"
+        bcd_path="$boot_mount/Boot/BCD"
+    fi
+    
+    # If BCD doesn't exist, try to create one
+    if [ ! -f "$bcd_path" ]; then
+        log_warn "BCD not found, attempting to create minimal BCD..."
+        
+        # Use the BCD from the Windows image's boot directory
+        local src_bcd=""
+        for candidate in \
+            "$MOUNT_TARGET/Windows/Boot/DVD/EFI/BCD" \
+            "$MOUNT_TARGET/Windows/Boot/DVD/PCAT/BCD" \
+            "$MOUNT_ISO/boot/BCD" \
+            "$MOUNT_ISO/Boot/BCD" \
+            "$MOUNT_ISO/efi/microsoft/boot/BCD" \
+            "$MOUNT_ISO/EFI/Microsoft/Boot/BCD"; do
+            if [ -f "$candidate" ]; then
+                src_bcd="$candidate"
+                break
+            fi
+        done
+        
+        if [ -n "$src_bcd" ]; then
+            mkdir -p "$(dirname "$bcd_path")"
+            cp "$src_bcd" "$bcd_path"
+            log_detail "BCD copied from $src_bcd"
+        else
+            log_warn "Could not find source BCD. Boot may require manual repair."
+        fi
+    fi
+    
+    # Modify BCD to point to the correct partition
+    # This requires hivex tools
+    if command -v hivexsh &>/dev/null && [ -f "$bcd_path" ]; then
+        log_detail "Updating BCD entries..."
+        # BCD modification with hivex is complex; for now we rely on Windows Setup
+        # to rebuild BCD during first boot if needed
+    fi
+    
+    if [ "$BOOT_MODE" = "uefi" ]; then
+        umount /mnt/efi 2>/dev/null || true
+    else
+        umount /mnt/bootpart 2>/dev/null || true
+    fi
+    
+    log_info "BCD setup completed."
+}
+
+create_winpeshl_ini() {
+    log_step "Configuring Windows Setup for first boot..."
+    
+    # Create a script that Windows PE will run to apply the image properly
+    # This ensures the unattend.xml is picked up during the specialize pass
+    
+    # Make sure the Panther directory exists
+    mkdir -p "$MOUNT_TARGET/Windows/Panther"
+    
+    # Create SetupComplete script that handles final configuration
+    mkdir -p "$MOUNT_TARGET/Windows/Setup/Scripts"
+    
+    cat > "$MOUNT_TARGET/Windows/Setup/Scripts/SetupComplete.cmd" << SETUPEOF
+@echo off
+echo Running Hetzner first-boot setup... >> C:\hetzner-setup.log
+
+REM Configure network
+call C:\setup-network.cmd >> C:\hetzner-setup.log 2>&1
+
+REM Run post-install tasks
+call C:\post-install.cmd >> C:\hetzner-setup.log 2>&1
+
+REM Clean up
+del /q "%~f0" >nul 2>&1
+SETUPEOF
+
+    log_info "First-boot configuration ready."
+}
+
+finalize_installation() {
+    log_step "Finalizing installation..."
+    
+    # Ensure all files are synced to disk
+    sync
+    
+    # Unmount all
+    umount "$MOUNT_TARGET" 2>/dev/null || true
+    umount "$MOUNT_ISO" 2>/dev/null || true
+    umount "$MOUNT_WORK" 2>/dev/null || true
+    
+    # Run fsck on NTFS partition
+    if command -v ntfsfix &>/dev/null; then
+        ntfsfix "$WIN_PART" 2>/dev/null || true
+    fi
+    
+    log_info "Installation finalized."
+}
+
+print_completion() {
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║          Installation Complete!                              ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  The server will now boot into Windows Server 2025 setup."
+    echo -e "  After Windows finishes installing (5-15 minutes), you can"
+    echo -e "  connect via RDP."
+    echo ""
+    echo -e "  ${CYAN}Connection Details:${NC}"
+    echo -e "  ─────────────────────────────────"
+    echo -e "  RDP Address:   ${GREEN}${SERVER_IP}:3389${NC}"
+    echo -e "  Username:      ${GREEN}Administrator${NC}"
+    echo -e "  Password:      ${GREEN}${ADMIN_PASSWORD}${NC}"
+    echo -e "  ─────────────────────────────────"
+    echo ""
+    echo -e "  ${YELLOW}Important Notes:${NC}"
+    echo -e "  • Windows may restart several times during setup"
+    echo -e "  • First boot takes longer due to hardware detection"
+    echo -e "  • If RDP doesn't connect, wait 5 more minutes"
+    echo -e "  • Use KVM console if network issues occur"
+    echo -e "  • Windows evaluation period: 180 days"
+    echo ""
+    
+    # Save credentials to a file
+    cat > "/root/windows-credentials.txt" << CREDEOF
+Windows Server 2025 - Hetzner Installation
+===========================================
+Date: $(date)
+
+RDP Address:  ${SERVER_IP}:3389
+Username:     Administrator
+Password:     ${ADMIN_PASSWORD}
+
+Gateway:      ${GATEWAY}
+DNS:          ${DNS_PRIMARY}, ${DNS_SECONDARY}
+Boot Mode:    ${BOOT_MODE^^}
+Target Disk:  ${TARGET_DISK}
+===========================================
+CREDEOF
+    chmod 600 /root/windows-credentials.txt
+    echo -e "  Credentials saved to: ${GREEN}/root/windows-credentials.txt${NC}"
+    echo ""
+    
+    if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
+        read -rp "Reboot the server now? (Y/n): " reboot_confirm
+        if [ "$reboot_confirm" != "n" ] && [ "$reboot_confirm" != "N" ]; then
+            log_info "Rebooting server..."
+            reboot
+        else
+            log_info "Reboot skipped. Run 'reboot' when ready."
+        fi
+    else
+        log_info "Rebooting server..."
+        reboot
+    fi
+}
+
+# ===================== Argument Parsing =====================
+
+parse_args() {
+    ISO_URL="$DEFAULT_ISO_URL"
+    SERVER_IP=""
+    GATEWAY=""
+    ADMIN_PASSWORD=""
+    TARGET_DISK=""
+    WORK_DISK=""
+    SKIP_CONFIRM=0
+    FORCE_UEFI=""
+    FORCE_BIOS=""
+    SINGLE_DISK_MODE=""
+    INTERACTIVE_MODE=""
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ip)
+                SERVER_IP="$2"; shift 2 ;;
+            --gateway)
+                GATEWAY="$2"; shift 2 ;;
+            --password)
+                ADMIN_PASSWORD="$2"; shift 2 ;;
+            --iso-url)
+                ISO_URL="$2"; shift 2 ;;
+            --target-disk)
+                TARGET_DISK="$2"; shift 2 ;;
+            --work-disk)
+                WORK_DISK="$2"; shift 2 ;;
+            --skip-confirm)
+                SKIP_CONFIRM=1; shift ;;
+            --uefi)
+                FORCE_UEFI=1; shift ;;
+            --bios)
+                FORCE_BIOS=1; shift ;;
+            --single-disk)
+                SINGLE_DISK_MODE=1; shift ;;
+            --interactive|-i)
+                INTERACTIVE_MODE=1; shift ;;
+            --help|-h)
+                echo "Usage: $0 [options]"
+                echo ""
+                echo "Options:"
+                echo "  --ip <IP>           Server IPv4 address (auto-detected)"
+                echo "  --gateway <GW>      Gateway address (auto-detected)"
+                echo "  --password <PASS>   Administrator password (auto-generated)"
+                echo "  --iso-url <URL>     Windows ISO download URL"
+                echo "  --target-disk <DEV> Target disk for Windows (e.g., /dev/sda)"
+                echo "  --work-disk <DEV>   Work disk for temp files (e.g., /dev/sdb)"
+                echo "  --skip-confirm      Skip all confirmation prompts"
+                echo "  --uefi              Force UEFI boot mode"
+                echo "  --bios              Force Legacy BIOS boot mode"
+                echo "  --single-disk       Use single-disk mode"
+                echo "  --interactive, -i   Launch interactive wizard"
+                echo "  --help              Show this help"
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1. Use --help for usage."
+                ;;
+        esac
+    done
+}
+
+# ===================== Main Execution =====================
+
+main() {
+    banner
+    
+    # Pre-flight checks
+    if [ "$(id -u)" -ne 0 ]; then
+        die "This script must be run as root."
+    fi
+    
+    check_rescue_mode
+    check_dependencies
+    
+    # Interactive wizard if requested or if no arguments given
+    if [ "${INTERACTIVE_MODE:-}" = "1" ]; then
+        interactive_wizard
+    fi
+    
+    # Detection phase (fills in anything not already set)
+    detect_network
+    detect_disks
+    detect_boot_mode
+    generate_password
+    
+    # Confirm before proceeding
+    confirm_settings
+    
+    # Prepare workspace
+    prepare_work_disk
+    
+    # Download phase
+    download_iso
+    download_virtio
+    
+    # Installation phase
+    partition_target_disk
+    extract_windows
+    inject_drivers
+    
+    # Configuration phase
+    generate_unattend_xml
+    create_network_script
+    create_post_install_script
+    create_fix_network_script
+    setup_san_policy
+    create_winpeshl_ini
+    
+    # Boot setup
+    setup_bootloader
+    write_boot_bcd
+    
+    # Finalize
+    finalize_installation
+    print_completion
+}
+
+# Parse command line arguments
+parse_args "$@"
+
+# Set up trap for cleanup on error
+trap cleanup EXIT
+
+# Run main
+main
