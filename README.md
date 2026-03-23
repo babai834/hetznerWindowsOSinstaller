@@ -23,10 +23,11 @@ wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/m
 ### Interactive Wizard (Recommended for First-Time Users)
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --interactive
+wget -O /root/install.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh
+bash /root/install.sh --interactive
 ```
 
-This walks you through IP, gateway, disk selection, and password step by step.
+Interactive mode requires a real terminal and cannot be launched through a piped one-liner. The two-step command above walks you through IP, gateway, disk selection, and password step by step.
 
 ---
 
@@ -73,7 +74,9 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 1. **Hetzner dedicated server** in rescue mode (Linux 64-bit)
 2. **PuTTY or any SSH client** (just SSH — no SCP, no file transfers)
 3. **2 physical drives** — 1 for Windows, 1 for temp workspace/downloads
-4. **Minimum 4GB RAM**
+4. **Target disk**: at least 40 GB
+5. **Work disk**: at least 8 GB free for ISO + temp files
+6. **Minimum 4GB RAM**
 
 ---
 
@@ -83,9 +86,10 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 
 1. Create a GitHub repo (for example, `hetznerWindowsOSinstaller`)
 2. Upload `install.sh` and `install-windows.sh`
-3. Update the `INSTALLER_URL` in `install.sh`:
+3. Update `INSTALLER_API_URL` and `INSTALLER_RAW_URL` in `install.sh`:
    ```
-   https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh
+   https://api.github.com/repos/<owner>/<repo>/contents/install-windows.sh?ref=main
+   https://raw.githubusercontent.com/<owner>/<repo>/main/install-windows.sh
    ```
 4. Users run: `wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash`
 
@@ -182,6 +186,10 @@ All handled automatically. If network fails post-install, open KVM console and r
 - Use KVM console to check progress
 - Run `C:\fix-network.cmd` from KVM console if network is misconfigured
 
+### Interactive install fails immediately
+- `--interactive` must be run from a real terminal, not through `wget ... | bash`
+- Download `install.sh` first, then run `bash /root/install.sh --interactive`
+
 ### Windows stuck at "Getting ready"
 - Normal for first boot — can take 10-15 minutes
 
@@ -221,8 +229,4 @@ This means the BCD boot configuration has stale device references. Fix via KVM:
 
 ## License
 
-MIT License. See source for details.
-
-## License
-
-Custom deployment tool. Windows Server is used under Microsoft's evaluation terms (180-day trial). A license key is required for production use.
+Repository code is MIT-licensed. Windows Server media and activation remain subject to Microsoft's evaluation and licensing terms; a production deployment requires a valid Windows Server license.

@@ -49,7 +49,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.2.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -60,6 +60,9 @@ VIRTIO_ISO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads
 # Hetzner DNS servers
 DNS_PRIMARY="185.12.64.1"
 DNS_SECONDARY="185.12.64.2"
+
+MIN_TARGET_DISK_BYTES=40000000000
+MIN_WORK_DISK_BYTES=8000000000
 
 # Working directories
 MOUNT_ISO="/mnt/iso"
@@ -123,6 +126,20 @@ prefix_to_netmask() {
     done
 
     echo "$mask"
+}
+
+is_valid_ipv4() {
+    local ip="$1"
+    local octet
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a octets <<< "$ip"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        [ "$octet" -ge 0 ] && [ "$octet" -le 255 ] || return 1
+    done
 }
 
 get_candidate_disks() {
@@ -319,12 +336,10 @@ detect_network() {
         die "Could not detect gateway. Use --gateway to specify."
     fi
 
-    # Validate IPv4 format
-    local ipv4_re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-    if ! [[ "$SERVER_IP" =~ $ipv4_re ]]; then
+    if ! is_valid_ipv4 "$SERVER_IP"; then
         die "Invalid server IP format: $SERVER_IP"
     fi
-    if ! [[ "$GATEWAY" =~ $ipv4_re ]]; then
+    if ! is_valid_ipv4 "$GATEWAY"; then
         die "Invalid gateway format: $GATEWAY"
     fi
     
@@ -380,6 +395,15 @@ detect_disks() {
     if [ ! -b "$WORK_DISK" ]; then
         die "Work disk does not exist: $WORK_DISK"
     fi
+
+    local target_size work_size
+    target_size=$(lsblk -dbno SIZE "$TARGET_DISK" 2>/dev/null || echo 0)
+    work_size=$(lsblk -dbno SIZE "$WORK_DISK" 2>/dev/null || echo 0)
+
+    [ "$target_size" -ge "$MIN_TARGET_DISK_BYTES" ] || \
+        die "Target disk is too small for Windows Server: $TARGET_DISK ($(numfmt --to=iec "$target_size" 2>/dev/null || echo "$target_size"))"
+    [ "$work_size" -ge "$MIN_WORK_DISK_BYTES" ] || \
+        die "Work disk is too small for ISO workspace: $WORK_DISK ($(numfmt --to=iec "$work_size" 2>/dev/null || echo "$work_size"))"
 
     log_detail "Target disk (Windows): $TARGET_DISK"
     log_detail "Work disk (temp):      $WORK_DISK"
@@ -555,7 +579,7 @@ partition_target_disk() {
         WIN_PART=$(partition_path "$TARGET_DISK" 3)
         
         log_detail "Formatting EFI partition..."
-        mkfs.fat -F32 -n "EFI" "$EFI_PART"
+        mkfs.fat -F32 -n "EFI" "$EFI_PART" || die "Failed to format EFI partition"
         
     else
         log_detail "Creating MBR partition table (Legacy BIOS)..."
@@ -575,11 +599,11 @@ partition_target_disk() {
         WIN_PART=$(partition_path "$TARGET_DISK" 2)
         
         log_detail "Formatting boot partition..."
-        mkfs.ntfs -f -L "System Reserved" "$BOOT_PART"
+        mkfs.ntfs -f -L "System Reserved" "$BOOT_PART" || die "Failed to format System Reserved partition"
     fi
     
     log_detail "Formatting Windows partition..."
-    mkfs.ntfs -f -L "Windows" "$WIN_PART"
+    mkfs.ntfs -f -L "Windows" "$WIN_PART" || die "Failed to format Windows partition"
     
     log_info "Disk partitioned successfully."
 }
@@ -617,10 +641,13 @@ extract_windows() {
     
     # Check how many images exist
     local num_images
-    num_images=$(wimlib-imagex info "$wim_file" | grep "^Image Count:" | awk '{print $3}')
+    num_images=$(wimlib-imagex info "$wim_file" | awk '/^Image Count:/ {print $3; exit}') || die "Failed to inspect Windows image metadata"
+    [[ "$num_images" =~ ^[0-9]+$ ]] || die "Invalid Windows image metadata in $(basename "$wim_file")"
     if [ "${num_images:-0}" -lt 2 ]; then
         image_index=1
     fi
+
+    wimlib-imagex info "$wim_file" "$image_index" >/dev/null 2>&1 || die "Selected Windows image index $image_index is not available"
     
     log_detail "Applying image index $image_index to $WIN_PART..."
     wimlib-imagex apply "$wim_file" "$image_index" "$MOUNT_TARGET" || die "Failed to apply Windows image"
@@ -645,17 +672,23 @@ inject_drivers() {
     
     # Copy relevant drivers to Windows
     local driver_dest="$MOUNT_TARGET/Windows/INF"
+    local copied_driver_dirs=0
     
     # Find Windows Server 2025/2022 drivers (w11 or 2k22 folder)
     for driver_dir in "$virtio_mount"/*/w11/amd64 "$virtio_mount"/*/2k22/amd64 "$virtio_mount"/*/2k25/amd64; do
         if [ -d "$driver_dir" ]; then
             log_detail "Copying drivers from $driver_dir"
-            cp -r "$driver_dir"/* "$driver_dest/" 2>/dev/null || true
+            cp -r "$driver_dir"/* "$driver_dest/" 2>/dev/null || log_warn "Failed to copy drivers from $driver_dir"
+            copied_driver_dirs=$((copied_driver_dirs + 1))
         fi
     done
     
     umount "$virtio_mount" 2>/dev/null || true
     rmdir "$virtio_mount" 2>/dev/null || true
+
+    if [ "$copied_driver_dirs" -eq 0 ]; then
+        log_warn "No matching VirtIO driver directories were found in the ISO. Continuing without offline driver injection."
+    fi
     
     log_info "Drivers injected."
 }
@@ -717,7 +750,7 @@ generate_unattend_xml() {
             </UserAccounts>
             <AutoLogon>
                 <Enabled>true</Enabled>
-                <Count>3</Count>
+                <Count>10</Count>
                 <Username>Administrator</Username>
                 <Password>
                     <Value>__ADMIN_PASSWORD__</Value>
@@ -785,10 +818,21 @@ timeout /t 10 /nobreak >nul
 
 REM Detect connected network adapter (handles multi-word adapter names)
 set "ADAPTER="
-powershell -NoProfile -Command "(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name" > "%TEMP%\nic.txt" 2>nul
+powershell -NoProfile -Command "(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1 -ExpandProperty Name)" > "%TEMP%\nic.txt" 2>nul
 set /p ADAPTER=<"%TEMP%\nic.txt"
 del "%TEMP%\nic.txt" >nul 2>&1
-if not defined ADAPTER set "ADAPTER=Ethernet"
+if not defined ADAPTER (
+    for %%n in ("Ethernet" "Ethernet0" "Local Area Connection") do (
+        netsh interface show interface name=%%n >nul 2>&1
+        if not errorlevel 1 (
+            set "ADAPTER=%%~n"
+            goto :adapter_found
+        )
+    )
+    echo [ERROR] No network adapter found >> C:\hetzner-setup.log
+    exit /b 1
+)
+:adapter_found
 
 echo Using adapter: %ADAPTER%
 
@@ -797,20 +841,22 @@ netsh interface ip set address name="%ADAPTER%" source=dhcp >nul 2>&1
 timeout /t 3 /nobreak >nul
 
 REM Configure static IP with /32 subnet (Hetzner point-to-point)
-netsh interface ipv4 set address name="%ADAPTER%" static ${SERVER_IP} ${SUBNET_MASK}
+netsh interface ipv4 set address name="%ADAPTER%" static ${SERVER_IP} ${SUBNET_MASK} none >nul 2>&1
+if errorlevel 1 exit /b 1
 
 REM Add gateway route (Hetzner requires the gateway to be added as a /32 route first)
-netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" ${GATEWAY}
-route add ${GATEWAY} mask 255.255.255.255 0.0.0.0 if 1 metric 1 >nul 2>&1
-
-REM Alternative routing method for Hetzner /32
-netsh interface ipv4 add neighbors "%ADAPTER%" ${GATEWAY} 00-00-00-00-00-00
-netsh interface ipv4 add route ${GATEWAY}/32 "%ADAPTER%" 0.0.0.0
-netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" ${GATEWAY}
+route delete 0.0.0.0 >nul 2>&1
+netsh interface ipv4 delete route ${GATEWAY}/32 "%ADAPTER%" >nul 2>&1
+netsh interface ipv4 delete route 0.0.0.0/0 "%ADAPTER%" >nul 2>&1
+netsh interface ipv4 add neighbors "%ADAPTER%" ${GATEWAY} 00-00-00-00-00-00 >nul 2>&1
+netsh interface ipv4 add route ${GATEWAY}/32 "%ADAPTER%" 0.0.0.0 >nul 2>&1
+netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" ${GATEWAY} >nul 2>&1
+route print 0.0.0.0 | find "${GATEWAY}" >nul 2>&1 || exit /b 1
 
 REM Configure DNS servers
 netsh interface ipv4 set dns name="%ADAPTER%" static ${DNS_PRIMARY}
 netsh interface ipv4 add dns name="%ADAPTER%" ${DNS_SECONDARY} index=2
+ipconfig | find "${SERVER_IP}" >nul 2>&1 || exit /b 1
 
 REM Disable IPv6 privacy extensions (servers should use static addresses)  
 netsh interface ipv6 set privacy state=disabled
@@ -840,21 +886,34 @@ timeout /t 10 /nobreak >nul
 
 REM Detect connected network adapter (handles multi-word adapter names)
 set "ADAPTER="
-powershell -NoProfile -Command "(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name" > "%TEMP%\nic.txt" 2>nul
+powershell -NoProfile -Command "(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1 -ExpandProperty Name)" > "%TEMP%\nic.txt" 2>nul
 set /p ADAPTER=<"%TEMP%\nic.txt"
 del "%TEMP%\nic.txt" >nul 2>&1
-if not defined ADAPTER set "ADAPTER=Ethernet"
+if not defined ADAPTER (
+    for %%n in ("Ethernet" "Ethernet0" "Local Area Connection") do (
+        netsh interface show interface name=%%n >nul 2>&1
+        if not errorlevel 1 (
+            set "ADAPTER=%%~n"
+            goto :adapter_found
+        )
+    )
+    echo [ERROR] No network adapter found >> C:\hetzner-setup.log
+    exit /b 1
+)
+:adapter_found
 
 echo Using adapter: %ADAPTER%
 netsh interface ip set address name="%ADAPTER%" source=dhcp >nul 2>&1
 timeout /t 3 /nobreak >nul
 
 netsh interface ipv4 set address name="%ADAPTER%" static ${SERVER_IP} ${SUBNET_MASK} ${GATEWAY} 1
+if errorlevel 1 exit /b 1
 netsh interface ipv4 set dns name="%ADAPTER%" static ${DNS_PRIMARY}
 netsh interface ipv4 add dns name="%ADAPTER%" ${DNS_SECONDARY} index=2
 netsh interface ipv6 set privacy state=disabled
 netsh advfirewall firewall add rule name="Allow ICMPv4" protocol=icmpv4 dir=in action=allow >nul 2>&1
 netsh advfirewall firewall add rule name="Allow ICMPv6" protocol=icmpv6 dir=in action=allow >nul 2>&1
+ipconfig | find "${SERVER_IP}" >nul 2>&1 || exit /b 1
 
 echo Network configuration applied.
 echo IP: ${SERVER_IP}/${SUBNET_PREFIX}
@@ -996,12 +1055,14 @@ netsh interface ipv4 set address name="%ADAPTER%" static %SERVER_IP% %SUBNET_MAS
 
 echo [3/5] Configuring routing...
 if /I "%NETWORK_MODE%"=="point-to-point" (
-    netsh interface ipv4 add route %GATEWAY%/32 "%ADAPTER%" 0.0.0.0 metric=1 >nul 2>&1
-    netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" %GATEWAY% metric=1 >nul 2>&1
     route delete 0.0.0.0 >nul 2>&1
-    route add %GATEWAY% mask 255.255.255.255 0.0.0.0 >nul 2>&1
-    route add 0.0.0.0 mask 0.0.0.0 %GATEWAY% >nul 2>&1
+    netsh interface ipv4 delete route %GATEWAY%/32 "%ADAPTER%" >nul 2>&1
+    netsh interface ipv4 delete route 0.0.0.0/0 "%ADAPTER%" >nul 2>&1
+    netsh interface ipv4 add neighbors "%ADAPTER%" %GATEWAY% 00-00-00-00-00-00 >nul 2>&1
+    netsh interface ipv4 add route %GATEWAY%/32 "%ADAPTER%" 0.0.0.0 >nul 2>&1
+    netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" %GATEWAY% >nul 2>&1
 )
+route print 0.0.0.0 | find "%GATEWAY%" >nul 2>&1 || echo [WARN] Default route verification failed
 
 echo [4/5] Setting DNS (%DNS1%, %DNS2%)...
 netsh interface ipv4 set dns name="%ADAPTER%" static %DNS1%
@@ -1215,6 +1276,9 @@ write_boot_bcd() {
         return
     fi
     
+    sync
+    udevadm settle --timeout=5 2>/dev/null || true
+
     mkdir -p "$(dirname "$bcd_path")"
     cp "$src_bcd" "$bcd_path"
     log_detail "BCD initialized from $src_bcd"
