@@ -161,9 +161,9 @@ cleanup() {
         umount /mnt/efi 2>/dev/null || true
         umount /mnt/bootpart 2>/dev/null || true
     fi
-    [ -d "$MOUNT_ISO" ] && rmdir "$MOUNT_ISO" 2>/dev/null || true
-    [ -d "$MOUNT_WORK" ] && rmdir "$MOUNT_WORK" 2>/dev/null || true
-    [ -d "$MOUNT_TARGET" ] && rmdir "$MOUNT_TARGET" 2>/dev/null || true
+    if [ -d "$MOUNT_ISO" ]; then rmdir "$MOUNT_ISO" 2>/dev/null || true; fi
+    if [ -d "$MOUNT_WORK" ]; then rmdir "$MOUNT_WORK" 2>/dev/null || true; fi
+    if [ -d "$MOUNT_TARGET" ]; then rmdir "$MOUNT_TARGET" 2>/dev/null || true; fi
 }
 
 die() {
@@ -445,7 +445,7 @@ prepare_work_disk() {
     log_step "Preparing work disk..."
     
     # Unmount any existing mounts on work disk
-    umount "${WORK_DISK}"* 2>/dev/null || true
+    lsblk -lnpo NAME "$WORK_DISK" 2>/dev/null | grep -v "^${WORK_DISK}$" | xargs -r umount 2>/dev/null || true
 
     # Wipe and format the entire work disk
     wipefs -a "$WORK_DISK" 2>/dev/null || true
@@ -526,8 +526,8 @@ download_virtio() {
 partition_target_disk() {
     log_step "Partitioning target disk ($TARGET_DISK)..."
     
-    # Unmount any existing partitions
-    umount "${TARGET_DISK}"* 2>/dev/null || true
+    # Unmount any existing partitions on target disk
+    lsblk -lnpo NAME "$TARGET_DISK" 2>/dev/null | grep -v "^${TARGET_DISK}$" | xargs -r umount 2>/dev/null || true
     
     # Wipe existing partition table
     wipefs -a "$TARGET_DISK" 2>/dev/null || true
