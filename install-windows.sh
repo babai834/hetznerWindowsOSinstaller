@@ -49,7 +49,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -129,22 +129,38 @@ get_candidate_disks() {
     lsblk -dbno NAME,SIZE,TYPE | awk '$3 == "disk" && $2 > 0 {print "/dev/" $1 " " $2}' | sort -k2,2nr
 }
 
+# Returns the partition device path for a given disk and partition number.
+# Handles NVMe (/dev/nvme0n1 -> /dev/nvme0n1p1), eMMC, loop, and standard
+# SCSI/SATA (/dev/sda -> /dev/sda1) naming conventions.
+partition_path() {
+    local disk="$1" num="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        echo "${disk}p${num}"
+    else
+        echo "${disk}${num}"
+    fi
+}
+
 banner() {
+    local ver_line
+    ver_line=$(printf "%-62s" "     Windows Server 2025 Installer — v${SCRIPT_VERSION}")
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║     Windows Server 2025 Installer for Hetzner Servers      ║"
-    echo "║                      Version ${SCRIPT_VERSION}                         ║"
+    printf "║%s║\n" "$ver_line"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
 
 cleanup() {
-    log_info "Cleaning up mount points..."
-    umount "$MOUNT_ISO" 2>/dev/null || true
-    umount "$MOUNT_WORK" 2>/dev/null || true
-    umount "$MOUNT_TARGET" 2>/dev/null || true
-    umount /mnt/efi 2>/dev/null || true
-    umount /mnt/bootpart 2>/dev/null || true
+    # Only print and act if anything is actually mounted
+    if mount | grep -qE "$MOUNT_ISO|$MOUNT_WORK|$MOUNT_TARGET|/mnt/efi|/mnt/bootpart" 2>/dev/null; then
+        log_info "Cleaning up mount points..."
+        umount "$MOUNT_ISO" 2>/dev/null || true
+        umount "$MOUNT_WORK" 2>/dev/null || true
+        umount "$MOUNT_TARGET" 2>/dev/null || true
+        umount /mnt/efi 2>/dev/null || true
+        umount /mnt/bootpart 2>/dev/null || true
+    fi
     [ -d "$MOUNT_ISO" ] && rmdir "$MOUNT_ISO" 2>/dev/null || true
     [ -d "$MOUNT_WORK" ] && rmdir "$MOUNT_WORK" 2>/dev/null || true
     [ -d "$MOUNT_TARGET" ] && rmdir "$MOUNT_TARGET" 2>/dev/null || true
@@ -238,7 +254,7 @@ interactive_wizard() {
 
 check_dependencies() {
     log_step "Checking dependencies..."
-    local deps=(wget parted mkfs.ntfs wimlib-imagex sfdisk lsblk mkfs.fat awk cut ip python3 blkid)
+    local deps=(wget parted mkfs.ntfs wimlib-imagex lsblk mkfs.fat awk cut ip python3 blkid numfmt)
     local missing=()
     
     for dep in "${deps[@]}"; do
@@ -301,6 +317,15 @@ detect_network() {
     
     if [ -z "$GATEWAY" ]; then
         die "Could not detect gateway. Use --gateway to specify."
+    fi
+
+    # Validate IPv4 format
+    local ipv4_re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    if ! [[ "$SERVER_IP" =~ $ipv4_re ]]; then
+        die "Invalid server IP format: $SERVER_IP"
+    fi
+    if ! [[ "$GATEWAY" =~ $ipv4_re ]]; then
+        die "Invalid gateway format: $GATEWAY"
     fi
     
     log_detail "Server IP:  $SERVER_IP"
@@ -402,7 +427,9 @@ confirm_settings() {
     echo -e "  Boot Mode:        ${GREEN}${BOOT_MODE^^}${NC}"
     echo -e "  Network Mode:     ${GREEN}${NETWORK_MODE}${NC}"
     echo -e "  Subnet Mask:      ${GREEN}${SUBNET_MASK}${NC}"
-    echo -e "  ISO URL:          ${GREEN}${ISO_URL:0:60}...${NC}"
+    local iso_display="$ISO_URL"
+    [ ${#iso_display} -gt 60 ] && iso_display="${ISO_URL:0:57}..."
+    echo -e "  ISO URL:          ${GREEN}${iso_display}${NC}"
     echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "${RED}  ⚠ WARNING: ALL DATA ON $TARGET_DISK WILL BE DESTROYED!${NC}"
@@ -427,11 +454,7 @@ prepare_work_disk() {
     partprobe "$WORK_DISK" 2>/dev/null || true
     udevadm settle --timeout=10 2>/dev/null || sleep 3
 
-    WORK_PART="${WORK_DISK}1"
-    # Handle NVMe naming
-    if [[ "$WORK_DISK" == *"nvme"* ]]; then
-        WORK_PART="${WORK_DISK}p1"
-    fi
+    WORK_PART=$(partition_path "$WORK_DISK" 1)
     
     log_detail "Formatting workspace partition: $WORK_PART"
     mkfs.ntfs -f -L "WORKSPACE" "$WORK_PART" || die "Failed to format workspace"
@@ -528,14 +551,8 @@ partition_target_disk() {
         partprobe "$TARGET_DISK" 2>/dev/null || true
         udevadm settle --timeout=10 2>/dev/null || sleep 3
         
-        # Determine partition naming
-        if [[ "$TARGET_DISK" == *"nvme"* ]]; then
-            EFI_PART="${TARGET_DISK}p1"
-            WIN_PART="${TARGET_DISK}p3"
-        else
-            EFI_PART="${TARGET_DISK}1"
-            WIN_PART="${TARGET_DISK}3"
-        fi
+        EFI_PART=$(partition_path "$TARGET_DISK" 1)
+        WIN_PART=$(partition_path "$TARGET_DISK" 3)
         
         log_detail "Formatting EFI partition..."
         mkfs.fat -F32 -n "EFI" "$EFI_PART"
@@ -554,13 +571,8 @@ partition_target_disk() {
         partprobe "$TARGET_DISK" 2>/dev/null || true
         udevadm settle --timeout=10 2>/dev/null || sleep 3
         
-        if [[ "$TARGET_DISK" == *"nvme"* ]]; then
-            BOOT_PART="${TARGET_DISK}p1"
-            WIN_PART="${TARGET_DISK}p2"
-        else
-            BOOT_PART="${TARGET_DISK}1"
-            WIN_PART="${TARGET_DISK}2"
-        fi
+        BOOT_PART=$(partition_path "$TARGET_DISK" 1)
+        WIN_PART=$(partition_path "$TARGET_DISK" 2)
         
         log_detail "Formatting boot partition..."
         mkfs.ntfs -f -L "System Reserved" "$BOOT_PART"
@@ -737,12 +749,14 @@ generate_unattend_xml() {
 </unattend>
 XMLEOF
     
-    # Replace password placeholder via stdin to avoid exposure in process list
+    # Replace password placeholder via stdin to avoid exposure in process list.
+    # XML-escape special characters to prevent broken unattend.xml.
     python3 -c "
-import sys
+import sys, html
 pw = sys.stdin.readline().rstrip('\\n')
+escaped = html.escape(pw, quote=True)
 with open(sys.argv[1], 'r') as f: data = f.read()
-data = data.replace('__ADMIN_PASSWORD__', pw)
+data = data.replace('__ADMIN_PASSWORD__', escaped)
 with open(sys.argv[1], 'w') as f: f.write(data)
 " "$MOUNT_TARGET/Windows/Panther/unattend.xml" <<< "$ADMIN_PASSWORD"
     
@@ -875,7 +889,7 @@ netsh advfirewall firewall add rule name="RDP-UDP-3389" protocol=UDP dir=in loca
 
 REM --- Configure RDP Settings ---
 reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v PortNumber /t REG_DWORD /d 3389 /f >nul 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v SecurityLayer /t REG_DWORD /d 2 /f >nul 2>&1
 
 REM --- Set High Performance Power Plan ---
 powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c >nul 2>&1
@@ -1259,10 +1273,9 @@ finalize_installation() {
     umount "$MOUNT_ISO" 2>/dev/null || true
     umount "$MOUNT_WORK" 2>/dev/null || true
     
-    # Run fsck on NTFS partition
-    if command -v ntfsfix &>/dev/null; then
-        ntfsfix "$WIN_PART" 2>/dev/null || true
-    fi
+    # Note: Do NOT run ntfsfix here. On a freshly applied WIM image the NTFS
+    # journal is clean; ntfsfix can alter metadata in ways that trigger an
+    # unwanted chkdsk on first Windows boot.
     
     log_info "Installation finalized."
 }
@@ -1347,16 +1360,22 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --ip)
+                [ $# -ge 2 ] || die "$1 requires a value."
                 SERVER_IP="$2"; shift 2 ;;
             --gateway)
+                [ $# -ge 2 ] || die "$1 requires a value."
                 GATEWAY="$2"; shift 2 ;;
             --password)
+                [ $# -ge 2 ] || die "$1 requires a value."
                 ADMIN_PASSWORD="$2"; shift 2 ;;
             --iso-url)
+                [ $# -ge 2 ] || die "$1 requires a value."
                 ISO_URL="$2"; shift 2 ;;
             --target-disk)
+                [ $# -ge 2 ] || die "$1 requires a value."
                 TARGET_DISK="$2"; shift 2 ;;
             --work-disk)
+                [ $# -ge 2 ] || die "$1 requires a value."
                 WORK_DISK="$2"; shift 2 ;;
             --skip-confirm)
                 SKIP_CONFIRM=1; shift ;;
