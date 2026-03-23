@@ -47,6 +47,7 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 ## Features
 
 - **Zero-Upload Workflow** — Everything downloads directly on the server, no SCP needed
+- **Official Microsoft ISO** — Downloads directly from Microsoft's evaluation center
 - **Interactive Wizard** — Step-by-step guided setup via `--interactive` flag
 - **Fully Automated** — ISO download, partitioning, image extraction, boot setup
 - **Hetzner Network Ready** — Auto-configures /32 point-to-point routing, static IP, Hetzner DNS
@@ -217,6 +218,10 @@ This means the BCD boot configuration has stale device references. Fix via KVM:
 - Change the password after first login
 - Consider hardening RDP (change port, enable NLA)
 - 180-day evaluation period starts from first boot
+
+## License
+
+MIT License. See source for details.
 
 ## License
 

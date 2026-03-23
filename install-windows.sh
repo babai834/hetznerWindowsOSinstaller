@@ -5,10 +5,10 @@
 # CLOUD-READY: No SCP needed. Users only need PuTTY SSH.
 # 
 # ONE-LINER INSTALL (run from Hetzner rescue via PuTTY):
-#   wget -qO- https://YOUR_DOMAIN/install.sh | bash
+#   wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash
 #
 # Or download and run directly:
-#   wget -O install-windows.sh https://YOUR_DOMAIN/install-windows.sh && bash install-windows.sh
+#   wget -O install-windows.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh && bash install-windows.sh
 #
 # This script handles everything:
 #   - Dependency installation
@@ -49,11 +49,10 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="1.0.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_VERSION="2.0.0"
 
-# Default ISO URL (Windows Server 2025 Evaluation)
-DEFAULT_ISO_URL="https://uptobox.g-direct.workers.dev/6:/Upload%20Files/26100.32230.260111-0550.lt_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
+# Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
+DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
 
 # VirtIO drivers ISO (Red Hat signed, for Hetzner's KVM/QEMU if needed)
 VIRTIO_ISO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
@@ -63,7 +62,6 @@ DNS_PRIMARY="185.12.64.1"
 DNS_SECONDARY="185.12.64.2"
 
 # Working directories
-WORK_DIR="/tmp/win-install"
 MOUNT_ISO="/mnt/iso"
 MOUNT_WORK="/mnt/work"
 MOUNT_TARGET="/mnt/target"
@@ -142,6 +140,8 @@ cleanup() {
     umount "$MOUNT_ISO" 2>/dev/null || true
     umount "$MOUNT_WORK" 2>/dev/null || true
     umount "$MOUNT_TARGET" 2>/dev/null || true
+    umount /mnt/efi 2>/dev/null || true
+    umount /mnt/bootpart 2>/dev/null || true
     [ -d "$MOUNT_ISO" ] && rmdir "$MOUNT_ISO" 2>/dev/null || true
     [ -d "$MOUNT_WORK" ] && rmdir "$MOUNT_WORK" 2>/dev/null || true
     [ -d "$MOUNT_TARGET" ] && rmdir "$MOUNT_TARGET" 2>/dev/null || true
@@ -149,7 +149,6 @@ cleanup() {
 
 die() {
     log_error "$@"
-    cleanup
     exit 1
 }
 
@@ -236,7 +235,7 @@ interactive_wizard() {
 
 check_dependencies() {
     log_step "Checking dependencies..."
-    local deps=(wget parted mkfs.ntfs wimlib-imagex sfdisk lsblk mkfs.fat awk cut ip)
+    local deps=(wget parted mkfs.ntfs wimlib-imagex sfdisk lsblk mkfs.fat awk cut ip python3 blkid)
     local missing=()
     
     for dep in "${deps[@]}"; do
@@ -455,6 +454,9 @@ download_iso() {
     
     local final_size
     final_size=$(stat -c%s "$iso_path")
+    if [ "$final_size" -lt 2000000000 ]; then
+        die "Downloaded ISO is too small ($(numfmt --to=iec "$final_size")). Expected >2GB. The download may have failed or the URL may be invalid."
+    fi
     log_info "ISO downloaded successfully ($(numfmt --to=iec "$final_size"))"
     
     ISO_PATH="$iso_path"
@@ -642,9 +644,6 @@ generate_unattend_xml() {
 
     mkdir -p "$MOUNT_TARGET/Windows/Panther"
     
-    # Determine partition layout for unattend
-    local disk_id=0
-    
     if [ "$BOOT_MODE" = "uefi" ]; then
         cat > "$MOUNT_TARGET/Windows/Panther/unattend.xml" << 'XMLEOF'
 <?xml version="1.0" encoding="utf-8"?>
@@ -816,8 +815,13 @@ XMLEOF
 XMLEOF
     fi
     
-    # Replace password placeholder
-    sed -i "s|__ADMIN_PASSWORD__|${ADMIN_PASSWORD}|g" "$MOUNT_TARGET/Windows/Panther/unattend.xml"
+    # Replace password placeholder (use python to avoid sed issues with special chars)
+    python3 -c "
+import sys
+with open(sys.argv[1], 'r') as f: data = f.read()
+data = data.replace('__ADMIN_PASSWORD__', sys.argv[2])
+with open(sys.argv[1], 'w') as f: f.write(data)
+" "$MOUNT_TARGET/Windows/Panther/unattend.xml" "$ADMIN_PASSWORD"
     
     # Also place at root for Windows Setup to find it
     cp "$MOUNT_TARGET/Windows/Panther/unattend.xml" "$MOUNT_TARGET/unattend.xml"
@@ -1215,12 +1219,17 @@ setup_bios_boot() {
     mkdir -p "$boot_mount/Boot"
     
     if [ -d "$MOUNT_TARGET/Windows/Boot/PCAT" ]; then
-        cp -r "$MOUNT_TARGET/Windows/Boot/PCAT/"* "$boot_mount/Boot/" 2>/dev/null || true
+        # Copy everything except BCD and BCD.LOG files (they contain stale device references)
+        find "$MOUNT_TARGET/Windows/Boot/PCAT" -maxdepth 1 -type f \
+            ! -iname 'BCD' ! -iname 'BCD.*' \
+            -exec cp {} "$boot_mount/Boot/" \; 2>/dev/null || true
+        # Copy subdirectories
+        find "$MOUNT_TARGET/Windows/Boot/PCAT" -mindepth 1 -maxdepth 1 -type d \
+            -exec cp -r {} "$boot_mount/Boot/" \; 2>/dev/null || true
     fi
     
-    # Copy bootmgr
+    # Copy bootmgr (but NOT Boot/BCD — it contains stale device references)
     cp "$MOUNT_TARGET/bootmgr" "$boot_mount/" 2>/dev/null || true
-    cp "$MOUNT_TARGET/Boot/BCD" "$boot_mount/Boot/BCD" 2>/dev/null || true
     
     # Copy boot fonts
     mkdir -p "$boot_mount/Boot/Fonts"
@@ -1344,11 +1353,7 @@ echo Running Hetzner first-boot setup... >> C:\hetzner-setup.log
 
 REM Rebuild BCD with correct partition references (critical for first boot)
 echo Rebuilding BCD boot configuration... >> C:\hetzner-setup.log
-bcdboot C:\Windows /s S: /f UEFI >> C:\hetzner-setup.log 2>&1
-if errorlevel 1 (
-    REM Try without explicit system partition — let Windows find it
-    bcdboot C:\Windows /f UEFI >> C:\hetzner-setup.log 2>&1
-)
+bcdboot C:\Windows /f ALL >> C:\hetzner-setup.log 2>&1
 echo BCD rebuild complete. >> C:\hetzner-setup.log
 
 REM Configure network
@@ -1457,7 +1462,6 @@ parse_args() {
     SKIP_CONFIRM=0
     FORCE_UEFI=""
     FORCE_BIOS=""
-    SINGLE_DISK_MODE=""
     INTERACTIVE_MODE=""
     DRY_RUN=0
     
