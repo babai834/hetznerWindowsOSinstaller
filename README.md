@@ -9,7 +9,7 @@ Fully automated Windows Server 2025 deployment for Hetzner dedicated servers. **
 SSH into your Hetzner rescue system and run **one command**:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/YOUR_USERNAME/hetzner-windows-installer/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash
 ```
 
 That's it. Everything is downloaded and executed automatically.
@@ -17,13 +17,13 @@ That's it. Everything is downloaded and executed automatically.
 ### With Custom Password
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/YOUR_USERNAME/hetzner-windows-installer/main/install.sh | bash -s -- --password "YourPass123!"
+wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --password "YourPass123!"
 ```
 
 ### Interactive Wizard (Recommended for First-Time Users)
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/YOUR_USERNAME/hetzner-windows-installer/main/install.sh | bash -s -- --interactive
+wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --interactive
 ```
 
 This walks you through IP, gateway, disk selection, and password step by step.
@@ -80,13 +80,13 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 
 ### Option 1: GitHub (Recommended)
 
-1. Create a GitHub repo (e.g., `hetzner-windows-installer`)
+1. Create a GitHub repo (for example, `hetznerWindowsOSinstaller`)
 2. Upload `install.sh` and `install-windows.sh`
 3. Update the `INSTALLER_URL` in `install.sh`:
    ```
-   https://raw.githubusercontent.com/YOUR_USERNAME/hetzner-windows-installer/main/install-windows.sh
+   https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh
    ```
-4. Users run: `wget -qO- https://raw.githubusercontent.com/.../install.sh | bash`
+4. Users run: `wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash`
 
 ### Option 2: Any Web Server
 
@@ -102,7 +102,7 @@ Great for fast global delivery. Upload files and use the worker URL.
 
 ```bash
 # Download and run directly (no bootstrap)
-wget -O /root/install.sh https://YOUR_DOMAIN/install-windows.sh
+wget -O /root/install.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh
 bash /root/install.sh
 
 # Full manual control

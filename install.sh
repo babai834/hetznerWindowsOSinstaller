@@ -3,10 +3,10 @@
 # Bootstrap Loader - Windows Server 2025 Hetzner Installer
 #
 # ONE-LINER FOR USERS:
-#   wget -qO- https://raw.githubusercontent.com/YOUR_REPO/main/install.sh | bash
+#   wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash
 #
 # Or with custom password:
-#   wget -qO- https://raw.githubusercontent.com/YOUR_REPO/main/install.sh | bash -s -- --password "MyPass123"
+#   wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --password "MyPass123"
 #
 # This bootstrap script:
 #   1. Downloads the main installer to /root/
@@ -31,11 +31,11 @@ echo "╚═══════════════════════�
 echo -e "${NC}"
 
 # ─── Configuration ───────────────────────────────────────────────
-# IMPORTANT: Replace this URL with your actual hosted file location.
+# Installer source URL.
 # Options:
 #   - GitHub raw URL:  https://raw.githubusercontent.com/YOU/REPO/main/install-windows.sh
 #   - Any direct URL:  https://your-domain.com/install-windows.sh
-INSTALLER_URL="https://raw.githubusercontent.com/YOUR_USERNAME/hetzner-windows-installer/main/install-windows.sh"
+INSTALLER_URL="https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh"
 # ─────────────────────────────────────────────────────────────────
 
 INSTALL_DIR="/root"
