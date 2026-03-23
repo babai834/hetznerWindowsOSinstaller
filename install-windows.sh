@@ -98,6 +98,9 @@ progress_step() {
 
 prefix_to_netmask() {
     local prefix="$1"
+    if ! [[ "$prefix" =~ ^[0-9]+$ ]] || [ "$prefix" -lt 0 ] || [ "$prefix" -gt 32 ]; then
+        die "Invalid subnet prefix: $prefix"
+    fi
     local mask=""
     local octet
     local remaining=$prefix
@@ -269,7 +272,6 @@ detect_network() {
         die "Could not detect IPv4 address from rescue environment."
     fi
 
-    PRIMARY_IFACE=$(awk '{print $1}' <<< "$primary_addr")
     local cidr
     cidr=$(awk '{print $2}' <<< "$primary_addr")
 
@@ -293,9 +295,6 @@ detect_network() {
         NETWORK_MODE="standard"
     fi
     
-    # Detect IPv6
-    SERVER_IPV6=$(ip -o -6 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1) || true
-    
     if [ -z "$SERVER_IP" ]; then
         die "Could not detect server IP. Use --ip to specify."
     fi
@@ -308,7 +307,6 @@ detect_network() {
     log_detail "Gateway:    $GATEWAY"
     log_detail "Subnet:     $SUBNET_MASK (/$SUBNET_PREFIX)"
     log_detail "Mode:       $NETWORK_MODE"
-    [ -n "${SERVER_IPV6:-}" ] && log_detail "IPv6:       $SERVER_IPV6"
 }
 
 detect_disks() {
@@ -345,6 +343,19 @@ detect_disks() {
         WORK_DISK="${ALL_DISKS[1]}"
     fi
     
+    # Validate that target and work disks are different
+    if [ "$TARGET_DISK" = "$WORK_DISK" ]; then
+        die "Target disk and work disk cannot be the same device: $TARGET_DISK"
+    fi
+
+    # Validate that disks actually exist
+    if [ ! -b "$TARGET_DISK" ]; then
+        die "Target disk does not exist: $TARGET_DISK"
+    fi
+    if [ ! -b "$WORK_DISK" ]; then
+        die "Work disk does not exist: $WORK_DISK"
+    fi
+
     log_detail "Target disk (Windows): $TARGET_DISK"
     log_detail "Work disk (temp):      $WORK_DISK"
 }
@@ -414,7 +425,7 @@ prepare_work_disk() {
     parted -s "$WORK_DISK" mklabel gpt
     parted -s "$WORK_DISK" mkpart primary ntfs 1MiB 100%
     partprobe "$WORK_DISK" 2>/dev/null || true
-    sleep 2
+    udevadm settle --timeout=10 2>/dev/null || sleep 3
 
     WORK_PART="${WORK_DISK}1"
     # Handle NVMe naming
@@ -449,7 +460,7 @@ download_iso() {
     log_detail "URL: $ISO_URL"
     log_detail "This may take 10-20 minutes depending on network speed..."
     
-    wget --no-check-certificate -O "$iso_path" "$ISO_URL" \
+    wget -O "$iso_path" "$ISO_URL" \
         --progress=bar:force:noscroll 2>&1 || die "Failed to download ISO"
     
     local final_size
@@ -477,7 +488,7 @@ download_virtio() {
         fi
     fi
     
-    wget --no-check-certificate -O "$virtio_path" "$VIRTIO_ISO_URL" \
+    wget -O "$virtio_path" "$VIRTIO_ISO_URL" \
         --progress=bar:force:noscroll 2>&1 || {
         log_warn "VirtIO download failed. Continuing without VirtIO drivers."
         log_warn "This is fine for most Hetzner hardware (non-KVM)."
@@ -515,16 +526,14 @@ partition_target_disk() {
         parted -s "$TARGET_DISK" mkpart "Windows" ntfs 529MiB 100%
         
         partprobe "$TARGET_DISK" 2>/dev/null || true
-        sleep 2
+        udevadm settle --timeout=10 2>/dev/null || sleep 3
         
         # Determine partition naming
         if [[ "$TARGET_DISK" == *"nvme"* ]]; then
             EFI_PART="${TARGET_DISK}p1"
-            MSR_PART="${TARGET_DISK}p2"
             WIN_PART="${TARGET_DISK}p3"
         else
             EFI_PART="${TARGET_DISK}1"
-            MSR_PART="${TARGET_DISK}2"
             WIN_PART="${TARGET_DISK}3"
         fi
         
@@ -543,7 +552,7 @@ partition_target_disk() {
         parted -s "$TARGET_DISK" mkpart primary ntfs 501MiB 100%
         
         partprobe "$TARGET_DISK" 2>/dev/null || true
-        sleep 2
+        udevadm settle --timeout=10 2>/dev/null || sleep 3
         
         if [[ "$TARGET_DISK" == *"nvme"* ]]; then
             BOOT_PART="${TARGET_DISK}p1"
@@ -644,8 +653,7 @@ generate_unattend_xml() {
 
     mkdir -p "$MOUNT_TARGET/Windows/Panther"
     
-    if [ "$BOOT_MODE" = "uefi" ]; then
-        cat > "$MOUNT_TARGET/Windows/Panther/unattend.xml" << 'XMLEOF'
+    cat > "$MOUNT_TARGET/Windows/Panther/unattend.xml" << 'XMLEOF'
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
     <settings pass="windowsPE">
@@ -728,100 +736,15 @@ generate_unattend_xml() {
     </settings>
 </unattend>
 XMLEOF
-    else
-        # BIOS/MBR version (same content, different context)
-        cat > "$MOUNT_TARGET/Windows/Panther/unattend.xml" << 'XMLEOF'
-<?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
-    <settings pass="windowsPE">
-        <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <SetupUILanguage>
-                <UILanguage>en-US</UILanguage>
-            </SetupUILanguage>
-            <InputLocale>en-US</InputLocale>
-            <SystemLocale>en-US</SystemLocale>
-            <UILanguage>en-US</UILanguage>
-            <UserLocale>en-US</UserLocale>
-        </component>
-    </settings>
-    <settings pass="specialize">
-        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <ComputerName>WIN-HETZNER</ComputerName>
-            <TimeZone>UTC</TimeZone>
-        </component>
-        <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <fDenyTSConnections>false</fDenyTSConnections>
-        </component>
-        <component name="Networking-MPSSVC-Svc" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <FirewallGroups>
-                <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">
-                    <Active>true</Active>
-                    <Group>Remote Desktop</Group>
-                    <Profile>all</Profile>
-                </FirewallGroup>
-            </FirewallGroups>
-        </component>
-    </settings>
-    <settings pass="oobeSystem">
-        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <OOBE>
-                <HideEULAPage>true</HideEULAPage>
-                <HideLocalAccountScreen>true</HideLocalAccountScreen>
-                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
-                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
-                <ProtectYourPC>3</ProtectYourPC>
-                <SkipMachineOOBE>true</SkipMachineOOBE>
-                <SkipUserOOBE>true</SkipUserOOBE>
-            </OOBE>
-            <UserAccounts>
-                <AdministratorPassword>
-                    <Value>__ADMIN_PASSWORD__</Value>
-                    <PlainText>true</PlainText>
-                </AdministratorPassword>
-            </UserAccounts>
-            <AutoLogon>
-                <Enabled>true</Enabled>
-                <Count>3</Count>
-                <Username>Administrator</Username>
-                <Password>
-                    <Value>__ADMIN_PASSWORD__</Value>
-                    <PlainText>true</PlainText>
-                </Password>
-            </AutoLogon>
-            <FirstLogonCommands>
-                <SynchronousCommand wcm:action="add">
-                    <Order>1</Order>
-                    <CommandLine>cmd /c bcdboot C:\Windows /f ALL</CommandLine>
-                    <Description>Rebuild BCD boot configuration</Description>
-                    <RequiresUserInput>false</RequiresUserInput>
-                </SynchronousCommand>
-                <SynchronousCommand wcm:action="add">
-                    <Order>2</Order>
-                    <CommandLine>cmd /c C:\setup-network.cmd</CommandLine>
-                    <Description>Configure Hetzner Network</Description>
-                    <RequiresUserInput>false</RequiresUserInput>
-                </SynchronousCommand>
-                <SynchronousCommand wcm:action="add">
-                    <Order>3</Order>
-                    <CommandLine>cmd /c C:\post-install.cmd</CommandLine>
-                    <Description>Post-installation tasks</Description>
-                    <RequiresUserInput>false</RequiresUserInput>
-                </SynchronousCommand>
-            </FirstLogonCommands>
-        </component>
-    </settings>
-</unattend>
-XMLEOF
-    fi
     
-    # Replace password placeholder (use python to avoid sed issues with special chars)
+    # Replace password placeholder via stdin to avoid exposure in process list
     python3 -c "
 import sys
+pw = sys.stdin.readline().rstrip('\\n')
 with open(sys.argv[1], 'r') as f: data = f.read()
-data = data.replace('__ADMIN_PASSWORD__', sys.argv[2])
+data = data.replace('__ADMIN_PASSWORD__', pw)
 with open(sys.argv[1], 'w') as f: f.write(data)
-" "$MOUNT_TARGET/Windows/Panther/unattend.xml" "$ADMIN_PASSWORD"
+" "$MOUNT_TARGET/Windows/Panther/unattend.xml" <<< "$ADMIN_PASSWORD"
     
     # Also place at root for Windows Setup to find it
     cp "$MOUNT_TARGET/Windows/Panther/unattend.xml" "$MOUNT_TARGET/unattend.xml"
@@ -1138,8 +1061,8 @@ FIXEOF
 setup_san_policy() {
     log_step "Configuring SAN policy for disk recognition..."
 
-    # Create san policy file  
-    cat > "$MOUNT_TARGET/san-policy.xml" << 'SANEOF'
+    local san_xml="$MOUNT_TARGET/san-policy.xml"
+    cat > "$san_xml" << 'SANEOF'
 <?xml version='1.0' encoding='utf-8' standalone='yes'?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
   <settings pass="offlineServicing">
@@ -1149,6 +1072,30 @@ setup_san_policy() {
   </settings>
 </unattend>
 SANEOF
+
+    # Apply the SAN policy offline if DISM is available via wimlib
+    if command -v wimlib-imagex &>/dev/null; then
+        log_detail "Applying SAN policy via registry hive..."
+        # Set SAN policy directly in the SYSTEM registry hive
+        if [ -f "$MOUNT_TARGET/Windows/System32/config/SYSTEM" ]; then
+            python3 - "$MOUNT_TARGET/Windows/System32/config/SYSTEM" <<'PYEOF' 2>/dev/null || true
+import subprocess, sys
+hive = sys.argv[1]
+# SAN Policy 1 = Online All Disks
+# Set via hivexsh on the SYSTEM hive at ControlSet001\Services\partmgr\Parameters
+try:
+    proc = subprocess.run(['hivexsh', '-w', hive], input=(
+        'cd \\ControlSet001\\Services\\partmgr\\Parameters\n'
+        'setval 1\n'
+        'SanPolicy\n'
+        'dword:00000001\n'
+    ), capture_output=True, text=True, timeout=10)
+except Exception:
+    pass
+PYEOF
+        fi
+    fi
+    rm -f "$san_xml"
 
     log_info "SAN policy configured."
 }
@@ -1275,15 +1222,12 @@ write_boot_bcd() {
     rm -f "$bcd_path" "${bcd_path}.LOG" "${bcd_path}.LOG1" "${bcd_path}.LOG2" 2>/dev/null || true
     
     # Locate the BCD-Template shipped inside the installed Windows image.
+    # IMPORTANT: Do NOT use $MOUNT_TARGET/Boot/BCD — it contains stale device
+    # references from the WIM build environment and causes 0xc000000f.
     local src_bcd=""
-    for candidate in \
-        "$MOUNT_TARGET/Windows/System32/config/BCD-Template" \
-        "$MOUNT_TARGET/Boot/BCD"; do
-        if [ -f "$candidate" ]; then
-            src_bcd="$candidate"
-            break
-        fi
-    done
+    if [ -f "$MOUNT_TARGET/Windows/System32/config/BCD-Template" ]; then
+        src_bcd="$MOUNT_TARGET/Windows/System32/config/BCD-Template"
+    fi
     
     if [ -z "$src_bcd" ]; then
         log_warn "No BCD template found. Adding bcdboot recovery to first-boot commands."
@@ -1482,8 +1426,10 @@ parse_args() {
             --skip-confirm)
                 SKIP_CONFIRM=1; shift ;;
             --uefi)
+                [ -n "${FORCE_BIOS:-}" ] && die "Cannot use both --uefi and --bios."
                 FORCE_UEFI=1; shift ;;
             --bios)
+                [ -n "${FORCE_UEFI:-}" ] && die "Cannot use both --uefi and --bios."
                 FORCE_BIOS=1; shift ;;
             --single-disk)
                 die "--single-disk is not supported safely in this version. Use a second disk for workspace." ;;
