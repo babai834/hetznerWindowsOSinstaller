@@ -49,6 +49,7 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 
 - **Zero-Upload Workflow** — Everything downloads directly on the server, no SCP needed
 - **Official Microsoft ISO** — Downloads directly from Microsoft's evaluation center
+- **Hetzner ISO Mirror Fallback** — Retries from Hetzner's hosted Windows ISO mirror if the Microsoft CDN fails
 - **Interactive Wizard** — Step-by-step guided setup via `--interactive` flag
 - **Fully Automated** — ISO download, partitioning, image extraction, boot setup
 - **Hetzner Network Ready** — Auto-configures /32 point-to-point routing, static IP, Hetzner DNS
@@ -122,6 +123,9 @@ bash install-windows.sh \
 
 # Custom ISO
 bash install-windows.sh --iso-url "https://example.com/your-windows.iso"
+
+# Use Hetzner's hosted Windows ISO directly
+bash install-windows.sh --iso-url "https://download.hetzner.com/bootimages/windows/SW_DVD9_Win_Server_STD_CORE_2025_24H2_64Bit_English_DC_STD_MLF_X23-81891.ISO"
 
 # Interactive wizard
 bash install-windows.sh --interactive

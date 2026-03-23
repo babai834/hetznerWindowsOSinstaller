@@ -54,6 +54,10 @@ SCRIPT_VERSION="3.2.0"
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
 
+# Alternate ISO mirror hosted by Hetzner. Kept as a fallback for environments
+# where the Microsoft CDN is slow or temporarily unavailable.
+HETZNER_ISO_MIRROR_URL="https://download.hetzner.com/bootimages/windows/SW_DVD9_Win_Server_STD_CORE_2025_24H2_64Bit_English_DC_STD_MLF_X23-81891.ISO"
+
 # VirtIO drivers ISO (Red Hat signed, for Hetzner's KVM/QEMU if needed)
 VIRTIO_ISO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 
@@ -506,16 +510,27 @@ download_iso() {
     
     log_detail "URL: $ISO_URL"
     log_detail "This may take 10-20 minutes depending on network speed..."
-    
-    wget -O "$iso_path" "$ISO_URL" \
-        --progress=bar:force:noscroll 2>&1 || die "Failed to download ISO"
+
+    local download_url="$ISO_URL"
+    if ! wget -O "$iso_path" "$download_url" \
+        --progress=bar:force:noscroll 2>&1; then
+        if [ "$ISO_URL" = "$DEFAULT_ISO_URL" ]; then
+            log_warn "Primary Microsoft ISO download failed. Retrying with Hetzner mirror..."
+            download_url="$HETZNER_ISO_MIRROR_URL"
+            log_detail "Mirror URL: $download_url"
+            wget -O "$iso_path" "$download_url" \
+                --progress=bar:force:noscroll 2>&1 || die "Failed to download ISO from both Microsoft and Hetzner mirror"
+        else
+            die "Failed to download ISO"
+        fi
+    fi
     
     local final_size
     final_size=$(stat -c%s "$iso_path")
     if [ "$final_size" -lt 2000000000 ]; then
         die "Downloaded ISO is too small ($(numfmt --to=iec "$final_size")). Expected >2GB. The download may have failed or the URL may be invalid."
     fi
-    log_info "ISO downloaded successfully ($(numfmt --to=iec "$final_size"))"
+    log_info "ISO downloaded successfully ($(numfmt --to=iec "$final_size")) from $download_url"
     
     ISO_PATH="$iso_path"
 }
