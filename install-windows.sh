@@ -639,6 +639,8 @@ inject_drivers() {
 
 generate_unattend_xml() {
     log_step "Generating unattended answer file..."
+
+    mkdir -p "$MOUNT_TARGET/Windows/Panther"
     
     # Determine partition layout for unattend
     local disk_id=0
