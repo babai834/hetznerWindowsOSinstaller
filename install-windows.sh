@@ -49,7 +49,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="3.0.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -250,7 +250,7 @@ check_dependencies() {
     if [ ${#missing[@]} -gt 0 ]; then
         log_info "Installing missing dependencies: ${missing[*]}"
         apt-get update -qq
-        apt-get install -y -qq wget parted ntfs-3g wimtools dosfstools gdisk grub-pc-bin grub-efi-amd64-bin efibootmgr libhivex-bin 2>/dev/null || true
+        apt-get install -y -qq wget parted ntfs-3g wimtools dosfstools gdisk grub-pc-bin grub-efi-amd64-bin efibootmgr libhivex-bin ms-sys 2>/dev/null || true
         
         # Re-check
         for dep in "${deps[@]}"; do
@@ -769,23 +769,11 @@ echo Configuring Hetzner network...
 REM Wait for network adapter to be ready
 timeout /t 10 /nobreak >nul
 
-REM Get the network adapter name
-for /f "tokens=1* delims=:" %%a in ('netsh interface show interface ^| findstr /i "Dedicated Connected"') do (
-    for /f "tokens=4" %%n in ("%%b") do set "ADAPTER=%%n"
-)
-
-REM Fallback adapter name detection
-if not defined ADAPTER (
-    for /f "skip=3 tokens=3,4*" %%a in ('netsh interface show interface') do (
-        if "%%a"=="Connected" (
-            set "ADAPTER=%%c"
-            goto :found
-        )
-    )
-)
-:found
-
-REM If still not found, use common name
+REM Detect connected network adapter (handles multi-word adapter names)
+set "ADAPTER="
+powershell -NoProfile -Command "(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name" > "%TEMP%\nic.txt" 2>nul
+set /p ADAPTER=<"%TEMP%\nic.txt"
+del "%TEMP%\nic.txt" >nul 2>&1
 if not defined ADAPTER set "ADAPTER=Ethernet"
 
 echo Using adapter: %ADAPTER%
@@ -836,20 +824,11 @@ REM ============================================================
 echo Configuring server network...
 timeout /t 10 /nobreak >nul
 
-for /f "tokens=1* delims=:" %%a in ('netsh interface show interface ^| findstr /i "Dedicated Connected"') do (
-    for /f "tokens=4" %%n in ("%%b") do set "ADAPTER=%%n"
-)
-
-if not defined ADAPTER (
-    for /f "skip=3 tokens=3,4*" %%a in ('netsh interface show interface') do (
-        if "%%a"=="Connected" (
-            set "ADAPTER=%%c"
-            goto :found
-        )
-    )
-)
-:found
-
+REM Detect connected network adapter (handles multi-word adapter names)
+set "ADAPTER="
+powershell -NoProfile -Command "(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name" > "%TEMP%\nic.txt" 2>nul
+set /p ADAPTER=<"%TEMP%\nic.txt"
+del "%TEMP%\nic.txt" >nul 2>&1
 if not defined ADAPTER set "ADAPTER=Ethernet"
 
 echo Using adapter: %ADAPTER%
@@ -918,10 +897,6 @@ tzutil /s "UTC" >nul 2>&1
 REM --- Disable Ctrl+Alt+Del requirement ---
 reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableCAD /t REG_DWORD /d 1 /f >nul 2>&1
 
-REM --- Enable auto-login for first boot (will be disabled after setup) ---
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d "1" /f >nul 2>&1
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d "Administrator" /f >nul 2>&1
-
 REM --- Configure Windows Update to manual ---
 reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate /t REG_DWORD /d 0 /f >nul 2>&1
 reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v AUOptions /t REG_DWORD /d 3 /f >nul 2>&1
@@ -933,11 +908,7 @@ powershell -Command "Set-NetAdapterAdvancedProperty -Name '*' -RegistryKeyword '
 REM --- Install .NET 3.5 if available ---
 REM dism /online /enable-feature /featurename:NetFx3 /all >nul 2>&1
 
-REM --- Disable Auto-Logon after setup completes ---
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d "0" /f >nul 2>&1
-
-REM --- Clean up setup files ---
-del /q C:\setup-network.cmd >nul 2>&1
+REM --- Clean up (keep setup-network.cmd and fix-network.cmd as repair tools) ---
 del /q C:\post-install.cmd >nul 2>&1
 
 echo %date% %time% - Post-installation completed >> C:\hetzner-setup.log
@@ -980,24 +951,23 @@ set NETWORK_MODE=${NETWORK_MODE}
 set DNS1=${DNS_PRIMARY}
 set DNS2=${DNS_SECONDARY}
 
-REM Find adapter
-set ADAPTER=
-for /f "skip=3 tokens=3,4*" %%a in ('netsh interface show interface') do (
-    if "%%a"=="Connected" (
-        set "ADAPTER=%%c"
-        goto :found
+REM Detect connected network adapter (handles multi-word adapter names)
+set "ADAPTER="
+powershell -NoProfile -Command "(Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).Name" > "%TEMP%\nic.txt" 2>nul
+set /p ADAPTER=<"%TEMP%\nic.txt"
+del "%TEMP%\nic.txt" >nul 2>&1
+if not defined ADAPTER (
+    for %%n in ("Ethernet" "Ethernet0" "Local Area Connection") do (
+        netsh interface show interface name=%%n >nul 2>&1
+        if not errorlevel 1 (
+            set "ADAPTER=%%~n"
+            goto :found
+        )
     )
+    echo [ERROR] No network adapter found!
+    pause
+    exit /b 1
 )
-for %%n in ("Ethernet" "Ethernet0" "Local Area Connection") do (
-    netsh interface show interface name=%%n >nul 2>&1
-    if not errorlevel 1 (
-        set "ADAPTER=%%~n"
-        goto :found
-    )
-)
-echo [ERROR] No network adapter found!
-pause
-exit /b 1
 
 :found
 echo Using adapter: %ADAPTER%
@@ -1073,10 +1043,9 @@ setup_san_policy() {
 </unattend>
 SANEOF
 
-    # Apply the SAN policy offline if DISM is available via wimlib
-    if command -v wimlib-imagex &>/dev/null; then
+    # Apply the SAN policy directly in the SYSTEM registry hive
+    if command -v hivexsh &>/dev/null; then
         log_detail "Applying SAN policy via registry hive..."
-        # Set SAN policy directly in the SYSTEM registry hive
         if [ -f "$MOUNT_TARGET/Windows/System32/config/SYSTEM" ]; then
             python3 - "$MOUNT_TARGET/Windows/System32/config/SYSTEM" <<'PYEOF' 2>/dev/null || true
 import subprocess, sys
@@ -1185,16 +1154,13 @@ setup_bios_boot() {
     umount "$boot_mount"
     rmdir "$boot_mount"
     
-    # Write MBR boot code
-    if [ -f "$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" ]; then
-        # Use the Windows MBR
-        dd if="$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" of="$TARGET_DISK" bs=440 count=1 conv=notrunc 2>/dev/null || true
-    fi
-    
-    # Install generic MBR using ms-sys or syslinux if bootmgr approach fails
+    # Write MBR and NTFS VBR boot code using ms-sys.
+    # Note: bootmgr is a PE executable, NOT MBR boot sector data — never dd it to MBR.
     if command -v ms-sys &>/dev/null; then
         ms-sys -7 "$TARGET_DISK" 2>/dev/null || true
         ms-sys -n "$BOOT_PART" 2>/dev/null || true
+    else
+        log_warn "ms-sys not available. BIOS boot may require manual repair (bootsect /nt60)."
     fi
     
     log_info "Legacy BIOS boot configured."
@@ -1239,41 +1205,12 @@ write_boot_bcd() {
     cp "$src_bcd" "$bcd_path"
     log_detail "BCD initialized from $src_bcd"
     
-    # Patch the BCD hive with the real Windows partition UUID so that
-    # bootmgfw.efi can locate the OS.  The BCD-Template uses a placeholder
-    # device; we overwrite it with the actual partition GUID.
-    local win_partuuid=""
-    win_partuuid=$(blkid -s PARTUUID -o value "$WIN_PART" 2>/dev/null || true)
-    
-    if [ -n "$win_partuuid" ] && command -v hivexregedit &>/dev/null; then
-        log_detail "Patching BCD with partition UUID $win_partuuid ..."
-        
-        # Convert PARTUUID to the mixed-endian binary form Windows expects.
-        # GPT PARTUUID is a standard GUID like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
-        # Windows BCD stores it as a 16-byte little-endian binary blob.
-        local guid_bytes
-        guid_bytes=$(python3 - "$win_partuuid" <<'PYEOF'
-import sys, uuid
-u = uuid.UUID(sys.argv[1])
-# Windows BCD stores GUIDs in mixed-endian (first 3 groups LE, last 2 BE)
-print(','.join(f'{b:02x}' for b in u.bytes_le))
-PYEOF
-        )
-        
-        if [ -n "$guid_bytes" ]; then
-            # Build a hivex reg file that sets the partition device element on
-            # the default OS loader entry.
-            # BCD object {default} is at \Objects\{9dea862c-5cdd-4e70-acc1-f32b344d4795}
-            # Element 11000001 = ApplicationDevice (the OS partition)
-            # Element 21000001 = OSDevice (also the OS partition)
-            # The value is a binary blob; bytes 32..47 hold the partition GUID.
-            # Rather than patching raw binary, we create a minimal startup repair
-            # script that Windows runs at first boot to call bcdboot on itself.
-            log_detail "BCD template installed. First-boot bcdboot will finalize entries."
-        fi
-    else
-        log_detail "hivexregedit not available or PARTUUID not found; relying on first-boot repair."
-    fi
+    # The BCD-Template shipped with Windows uses "locate" device entries
+    # that search all partitions for \Windows\system32\winload.efi at boot.
+    # This allows the first boot to succeed without patching exact partition
+    # GUIDs into the binary BCD hive.  The first-boot bcdboot command
+    # (in SetupComplete.cmd and FirstLogonCommands) will then create a
+    # permanent BCD with the correct partition references.
     
     umount "$mount_point" 2>/dev/null || true
     log_info "BCD setup completed."
@@ -1293,6 +1230,10 @@ create_winpeshl_ini() {
     
     cat > "$MOUNT_TARGET/Windows/Setup/Scripts/SetupComplete.cmd" << SETUPEOF
 @echo off
+REM SetupComplete.cmd runs BEFORE FirstLogonCommands.
+REM Only rebuild BCD here; network and post-install run via FirstLogonCommands
+REM to avoid double-execution and file-deletion races.
+
 echo Running Hetzner first-boot setup... >> C:\hetzner-setup.log
 
 REM Rebuild BCD with correct partition references (critical for first boot)
@@ -1300,13 +1241,7 @@ echo Rebuilding BCD boot configuration... >> C:\hetzner-setup.log
 bcdboot C:\Windows /f ALL >> C:\hetzner-setup.log 2>&1
 echo BCD rebuild complete. >> C:\hetzner-setup.log
 
-REM Configure network
-call C:\setup-network.cmd >> C:\hetzner-setup.log 2>&1
-
-REM Run post-install tasks
-call C:\post-install.cmd >> C:\hetzner-setup.log 2>&1
-
-REM Clean up
+REM Clean up this script
 del /q "%~f0" >nul 2>&1
 SETUPEOF
 

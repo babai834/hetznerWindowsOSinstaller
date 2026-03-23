@@ -74,12 +74,12 @@ PY
 
 download_via_raw_url() {
     if command -v wget &>/dev/null; then
-        wget -q --no-check-certificate -O "$INSTALLER_PATH" "$INSTALLER_RAW_URL"
+        wget -q -O "$INSTALLER_PATH" "$INSTALLER_RAW_URL"
         return
     fi
 
     if command -v curl &>/dev/null; then
-        curl -fsSL -k -o "$INSTALLER_PATH" "$INSTALLER_RAW_URL"
+        curl -fsSL -o "$INSTALLER_PATH" "$INSTALLER_RAW_URL"
         return
     fi
 
@@ -106,6 +106,17 @@ chmod +x "$INSTALLER_PATH"
 
 echo -e "${GREEN}[3/3]${NC} Launching installer..."
 echo ""
+
+# Warn if --interactive is used with piped stdin (reads will fail)
+for arg in "$@"; do
+    if [ "$arg" = "--interactive" ] || [ "$arg" = "-i" ]; then
+        if [ ! -t 0 ]; then
+            echo -e "${RED}[ERROR]${NC} --interactive requires a terminal. Download first, then run:"
+            echo -e "  bash $INSTALLER_PATH --interactive"
+            exit 1
+        fi
+    fi
+done
 
 # Pass through any command-line arguments
 exec bash "$INSTALLER_PATH" "$@"
