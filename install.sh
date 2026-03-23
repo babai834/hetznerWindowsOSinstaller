@@ -35,7 +35,11 @@ echo -e "${NC}"
 # Options:
 #   - GitHub raw URL:  https://raw.githubusercontent.com/YOU/REPO/main/install-windows.sh
 #   - Any direct URL:  https://your-domain.com/install-windows.sh
-INSTALLER_URL="https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh"
+#
+# Add a cache-busting query string so newly pushed installer changes are
+# fetched immediately instead of occasionally serving a stale CDN response.
+CACHE_BUSTER=$(date +%s)
+INSTALLER_URL="https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh?ts=${CACHE_BUSTER}"
 # ─────────────────────────────────────────────────────────────────
 
 INSTALL_DIR="/root"
