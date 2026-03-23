@@ -51,7 +51,7 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 - **Fully Automated** — ISO download, partitioning, image extraction, boot setup
 - **Hetzner Network Ready** — Auto-configures /32 point-to-point routing, static IP, Hetzner DNS
 - **UEFI + Legacy BIOS** — Auto-detects boot mode and configures accordingly
-- **Dual or Single Disk** — Works with 2-disk servers (recommended) or single-disk fallback
+- **Two-Disk Workflow** — Uses one disk for Windows and one disk for workspace/downloads
 - **RDP Pre-configured** — Remote Desktop enabled and firewall rules applied on first boot
 - **Built-in Network Repair** — `C:\fix-network.cmd` auto-placed on Windows drive for KVM use
 - **Unattended Install** — Full OOBE bypass, auto-login for setup, and post-install hardening
@@ -71,7 +71,7 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 
 1. **Hetzner dedicated server** in rescue mode (Linux 64-bit)
 2. **PuTTY or any SSH client** (just SSH — no SCP, no file transfers)
-3. **2 physical drives** (recommended) — 1 for Windows, 1 for temp workspace
+3. **2 physical drives** — 1 for Windows, 1 for temp workspace/downloads
 4. **Minimum 4GB RAM**
 
 ---
@@ -115,9 +115,6 @@ bash install-windows.sh \
   --uefi \
   --skip-confirm
 
-# Single-disk mode
-bash install-windows.sh --single-disk
-
 # Custom ISO
 bash install-windows.sh --iso-url "https://example.com/your-windows.iso"
 
@@ -138,7 +135,6 @@ bash install-windows.sh --interactive
 | `--skip-confirm` | Skip all confirmation prompts | Off |
 | `--uefi` | Force UEFI boot mode | Auto-detect |
 | `--bios` | Force Legacy BIOS boot mode | Auto-detect |
-| `--single-disk` | Single-disk mode | Off (auto if 1 disk) |
 | `--interactive`, `-i` | Interactive wizard | Off |
 
 ---
@@ -190,8 +186,8 @@ All handled automatically. If network fails post-install, open KVM console and r
 - For UEFI: verify `/EFI/Microsoft/Boot/bootmgfw.efi` exists on EFI partition
 
 ### Only one disk available
-- Script auto-detects and uses single-disk mode
-- Or force with `--single-disk`
+- This version does not support single-disk installs safely
+- Add a second disk before running the installer
 
 ---
 

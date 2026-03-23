@@ -35,8 +35,12 @@
 #
 # Requirements:
 #   - Hetzner dedicated server booted into rescue mode
-#   - At least 2 physical drives (or --single-disk mode)
+#   - At least 2 physical drives
 #   - Minimum 4GB RAM
+#
+# Notes:
+#   - This version requires a dedicated workspace disk and does not support
+#     single-disk installs safely.
 #
 ###############################################################################
 
@@ -108,8 +112,7 @@ check_rescue_mode() {
     if [ ! -f /etc/hetzner-rescue ]; then
         # Alternative check
         if ! grep -qi "rescue" /etc/hostname 2>/dev/null && \
-           ! grep -qi "rescue" /proc/version 2>/dev/null && \
-           [ "$(whoami)" != "root" ]; then
+           ! grep -qi "rescue" /proc/version 2>/dev/null; then
             log_warn "This doesn't appear to be a Hetzner rescue system."
             log_warn "The script is designed for Hetzner rescue mode."
             if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
@@ -130,7 +133,7 @@ interactive_wizard() {
     
     # Auto-detect IP
     local detected_ip
-    detected_ip=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1) || true
+    detected_ip=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1) || true
     
     echo -e "  Detected server IP: ${GREEN}${detected_ip:-none}${NC}"
     read -rp "  Server IP [$detected_ip]: " input_ip
@@ -189,7 +192,7 @@ interactive_wizard() {
 
 check_dependencies() {
     log_step "Checking dependencies..."
-    local deps=(wget parted mkfs.ntfs wimlib-imagex sfdisk lsblk mkfs.fat)
+    local deps=(wget parted mkfs.ntfs wimlib-imagex sfdisk lsblk mkfs.fat awk cut ip)
     local missing=()
     
     for dep in "${deps[@]}"; do
@@ -219,7 +222,7 @@ detect_network() {
     
     # Auto-detect IP from rescue system
     if [ -z "${SERVER_IP:-}" ]; then
-        SERVER_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+        SERVER_IP=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
     fi
     
     # Auto-detect gateway
@@ -232,7 +235,7 @@ detect_network() {
     SUBNET_PREFIX="32"
     
     # Detect IPv6
-    SERVER_IPV6=$(ip -6 addr show scope global | grep -oP '(?<=inet6\s)[0-9a-f:]+' | head -1) || true
+    SERVER_IPV6=$(ip -o -6 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1) || true
     
     if [ -z "$SERVER_IP" ]; then
         die "Could not detect server IP. Use --ip to specify."
@@ -267,10 +270,8 @@ detect_disks() {
         log_detail "$disk - Size: $size - Model: $model"
     done
     
-    if [ ${#ALL_DISKS[@]} -lt 2 ] && [ -z "${SINGLE_DISK_MODE:-}" ]; then
-        log_warn "Only 1 disk detected. Using single-disk mode."
-        log_warn "A partition on the same disk will be used as workspace."
-        SINGLE_DISK_MODE=1
+    if [ ${#ALL_DISKS[@]} -lt 2 ]; then
+        die "This installer currently requires 2 physical disks: one target disk and one workspace disk. Single-disk mode is not supported safely in this version."
     fi
     
     # Target disk selection
@@ -281,12 +282,8 @@ detect_disks() {
     
     # Work disk selection
     if [ -z "${WORK_DISK:-}" ]; then
-        if [ "${SINGLE_DISK_MODE:-0}" = "1" ]; then
-            WORK_DISK="$TARGET_DISK"
-        else
-            # Use the second disk for workspace
-            WORK_DISK="${ALL_DISKS[1]}"
-        fi
+        # Use the second disk for workspace
+        WORK_DISK="${ALL_DISKS[1]}"
     fi
     
     log_detail "Target disk (Windows): $TARGET_DISK"
@@ -345,39 +342,18 @@ prepare_work_disk() {
     
     # Unmount any existing mounts on work disk
     umount "${WORK_DISK}"* 2>/dev/null || true
-    
-    if [ "${SINGLE_DISK_MODE:-0}" = "1" ]; then
-        # In single-disk mode, we'll create a temp partition at the end
-        log_info "Single-disk mode: creating temporary workspace partition..."
-        
-        # Get disk size in sectors
-        local disk_sectors
-        disk_sectors=$(blockdev --getsz "$WORK_DISK")
-        local sector_size=512
-        # Reserve last 20GB for workspace
-        local work_size=$((20 * 1024 * 1024 * 1024 / sector_size))
-        local work_start=$((disk_sectors - work_size))
-        
-        # Create a small partition at the end for workspace
-        echo "$work_start,$work_size,L" | sfdisk --append "$WORK_DISK" --no-reread 2>/dev/null || true
-        partprobe "$WORK_DISK" 2>/dev/null || true
-        sleep 2
-        
-        # Find the last partition
-        WORK_PART=$(lsblk -lnpo NAME "$WORK_DISK" | tail -1)
-    else
-        # Wipe and format the entire work disk
-        wipefs -a "$WORK_DISK" 2>/dev/null || true
-        parted -s "$WORK_DISK" mklabel gpt
-        parted -s "$WORK_DISK" mkpart primary ntfs 1MiB 100%
-        partprobe "$WORK_DISK" 2>/dev/null || true
-        sleep 2
-        
-        WORK_PART="${WORK_DISK}1"
-        # Handle NVMe naming
-        if [[ "$WORK_DISK" == *"nvme"* ]]; then
-            WORK_PART="${WORK_DISK}p1"
-        fi
+
+    # Wipe and format the entire work disk
+    wipefs -a "$WORK_DISK" 2>/dev/null || true
+    parted -s "$WORK_DISK" mklabel gpt
+    parted -s "$WORK_DISK" mkpart primary ntfs 1MiB 100%
+    partprobe "$WORK_DISK" 2>/dev/null || true
+    sleep 2
+
+    WORK_PART="${WORK_DISK}1"
+    # Handle NVMe naming
+    if [[ "$WORK_DISK" == *"nvme"* ]]; then
+        WORK_PART="${WORK_DISK}p1"
     fi
     
     log_detail "Formatting workspace partition: $WORK_PART"
@@ -1025,18 +1001,8 @@ FIXEOF
     log_info "Network repair tool embedded at C:\\fix-network.cmd"
 }
 
-setup_san_policy() {    log_step "Configuring SAN policy for disk recognition..."
-    
-    # Create diskpart script to enable all disks online
-    mkdir -p "$MOUNT_TARGET/Windows/Setup/Scripts"
-    
-    cat > "$MOUNT_TARGET/Windows/Setup/Scripts/SetupComplete.cmd" << 'SCEOF'
-@echo off
-REM Run network setup
-call C:\setup-network.cmd
-REM Run post-install
-call C:\post-install.cmd
-SCEOF
+setup_san_policy() {
+    log_step "Configuring SAN policy for disk recognition..."
 
     # Create san policy file  
     cat > "$MOUNT_TARGET/san-policy.xml" << 'SANEOF'
@@ -1356,7 +1322,7 @@ parse_args() {
             --bios)
                 FORCE_BIOS=1; shift ;;
             --single-disk)
-                SINGLE_DISK_MODE=1; shift ;;
+                die "--single-disk is not supported safely in this version. Use a second disk for workspace." ;;
             --interactive|-i)
                 INTERACTIVE_MODE=1; shift ;;
             --help|-h)
