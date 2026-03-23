@@ -102,8 +102,8 @@ Great for fast global delivery. Upload files and use the worker URL.
 
 ```bash
 # Download and run directly (no bootstrap)
-wget -O /root/install.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh
-bash /root/install.sh
+wget -O /root/install-windows.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh
+bash /root/install-windows.sh
 
 # Full manual control
 bash install-windows.sh \
@@ -120,6 +120,9 @@ bash install-windows.sh --iso-url "https://example.com/your-windows.iso"
 
 # Interactive wizard
 bash install-windows.sh --interactive
+
+# Safe validation only (no disk changes)
+bash install-windows.sh --dry-run
 ```
 
 ### Command-Line Options
@@ -136,6 +139,7 @@ bash install-windows.sh --interactive
 | `--uefi` | Force UEFI boot mode | Auto-detect |
 | `--bios` | Force Legacy BIOS boot mode | Auto-detect |
 | `--interactive`, `-i` | Interactive wizard | Off |
+| `--dry-run` | Validate detection and config only | Off |
 
 ---
 

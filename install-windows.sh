@@ -8,7 +8,7 @@
 #   wget -qO- https://YOUR_DOMAIN/install.sh | bash
 #
 # Or download and run directly:
-#   wget -O install.sh https://YOUR_DOMAIN/install-windows.sh && bash install.sh
+#   wget -O install-windows.sh https://YOUR_DOMAIN/install-windows.sh && bash install-windows.sh
 #
 # This script handles everything:
 #   - Dependency installation
@@ -32,6 +32,7 @@
 #   --uefi              Force UEFI boot mode
 #   --bios              Force Legacy BIOS boot mode
 #   --interactive       Launch interactive wizard (best for PuTTY users)
+#   --dry-run           Validate detection and configuration only
 #
 # Requirements:
 #   - Hetzner dedicated server booted into rescue mode
@@ -82,6 +83,50 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()    { echo -e "${CYAN}[STEP]${NC} $*"; }
 log_detail()  { echo -e "${BLUE}  →${NC} $*"; }
+
+TOTAL_STEPS=10
+
+progress_step() {
+    local step="$1"
+    local label="$2"
+    local percent=$(( step * 100 / TOTAL_STEPS ))
+    local filled=$(( percent / 5 ))
+    local bar
+
+    bar=$(printf '%*s' "$filled" '' | tr ' ' '#')
+    printf "\n${CYAN}[PROGRESS]${NC} Step %s/%s (%s%%) %-20s [%s%-*s]\n" \
+        "$step" "$TOTAL_STEPS" "$percent" "$label" "$bar" "$((20 - filled))" ""
+}
+
+prefix_to_netmask() {
+    local prefix="$1"
+    local mask=""
+    local octet
+    local remaining=$prefix
+
+    for _ in 1 2 3 4; do
+        if [ "$remaining" -ge 8 ]; then
+            octet=255
+            remaining=$((remaining - 8))
+        elif [ "$remaining" -gt 0 ]; then
+            octet=$((256 - 2 ** (8 - remaining)))
+            remaining=0
+        else
+            octet=0
+        fi
+
+        if [ -n "$mask" ]; then
+            mask+="."
+        fi
+        mask+="$octet"
+    done
+
+    echo "$mask"
+}
+
+get_candidate_disks() {
+    lsblk -dbno NAME,SIZE,TYPE | awk '$3 == "disk" && $2 > 0 {print "/dev/" $1 " " $2}' | sort -k2,2nr
+}
 
 banner() {
     echo -e "${CYAN}"
@@ -155,15 +200,16 @@ interactive_wizard() {
     # Disk selection
     echo ""
     log_info "Available disks:"
-    lsblk -dpno NAME,SIZE,MODEL | grep -v "loop\|ram" | while read -r line; do
-        echo -e "    ${GREEN}$line${NC}"
-    done
+    while read -r disk _size_bytes; do
+        [ -n "$disk" ] || continue
+        echo -e "    ${GREEN}$(lsblk -dpno NAME,SIZE,MODEL "$disk")${NC}"
+    done < <(get_candidate_disks)
     echo ""
     
     local first_disk
-    first_disk=$(lsblk -dpno NAME,TYPE | grep "disk" | awk '{print $1}' | head -1)
+    first_disk=$(get_candidate_disks | awk 'NR==1 {print $1}')
     local second_disk
-    second_disk=$(lsblk -dpno NAME,TYPE | grep "disk" | awk '{print $1}' | sed -n '2p') || true
+    second_disk=$(get_candidate_disks | awk 'NR==2 {print $1}') || true
     
     read -rp "  Target disk for Windows [$first_disk]: " input_target
     TARGET_DISK="${input_target:-$first_disk}"
@@ -172,9 +218,7 @@ interactive_wizard() {
         read -rp "  Work disk for temp files [$second_disk]: " input_work
         WORK_DISK="${input_work:-$second_disk}"
     else
-        WORK_DISK="$TARGET_DISK"
-        SINGLE_DISK_MODE=1
-        log_warn "Only 1 disk found — using single-disk mode."
+        die "This installer currently requires a second disk for workspace. Single-disk mode is disabled in this version."
     fi
     
     # ISO URL
@@ -219,20 +263,36 @@ check_dependencies() {
 
 detect_network() {
     log_step "Detecting network configuration..."
-    
-    # Auto-detect IP from rescue system
+    local primary_addr
+
+    primary_addr=$(ip -o -4 addr show scope global | awk 'NR==1 {print $2 " " $4}')
+    if [ -z "$primary_addr" ]; then
+        die "Could not detect IPv4 address from rescue environment."
+    fi
+
+    PRIMARY_IFACE=$(awk '{print $1}' <<< "$primary_addr")
+    local cidr
+    cidr=$(awk '{print $2}' <<< "$primary_addr")
+
     if [ -z "${SERVER_IP:-}" ]; then
-        SERVER_IP=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+        SERVER_IP="${cidr%/*}"
     fi
-    
-    # Auto-detect gateway
+
+    if [ -z "${SUBNET_PREFIX:-}" ]; then
+        SUBNET_PREFIX="${cidr#*/}"
+    fi
+
+    SUBNET_MASK=$(prefix_to_netmask "$SUBNET_PREFIX")
+
     if [ -z "${GATEWAY:-}" ]; then
-        GATEWAY=$(ip route | grep default | awk '{print $3}' | head -1)
+        GATEWAY=$(ip route show default | awk 'NR==1 {print $3}')
     fi
-    
-    # Auto-detect subnet mask (Hetzner uses /32 with point-to-point routing)
-    SUBNET_MASK="255.255.255.255"
-    SUBNET_PREFIX="32"
+
+    if [ "$SUBNET_PREFIX" = "32" ]; then
+        NETWORK_MODE="point-to-point"
+    else
+        NETWORK_MODE="standard"
+    fi
     
     # Detect IPv6
     SERVER_IPV6=$(ip -o -6 addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1) || true
@@ -247,15 +307,15 @@ detect_network() {
     
     log_detail "Server IP:  $SERVER_IP"
     log_detail "Gateway:    $GATEWAY"
-    log_detail "Subnet:     /$SUBNET_PREFIX"
+    log_detail "Subnet:     $SUBNET_MASK (/$SUBNET_PREFIX)"
+    log_detail "Mode:       $NETWORK_MODE"
     [ -n "${SERVER_IPV6:-}" ] && log_detail "IPv6:       $SERVER_IPV6"
 }
 
 detect_disks() {
     log_step "Detecting disk configuration..."
-    
-    # List all physical disks (exclude loop, ram, etc.)
-    mapfile -t ALL_DISKS < <(lsblk -dpno NAME,TYPE,SIZE | grep "disk" | awk '{print $1}')
+
+    mapfile -t ALL_DISKS < <(get_candidate_disks | awk '{print $1}')
     
     if [ ${#ALL_DISKS[@]} -eq 0 ]; then
         die "No disks detected!"
@@ -325,6 +385,8 @@ confirm_settings() {
     echo -e "  Target Disk:      ${GREEN}$TARGET_DISK${NC}"
     echo -e "  Work Disk:        ${GREEN}$WORK_DISK${NC}"
     echo -e "  Boot Mode:        ${GREEN}${BOOT_MODE^^}${NC}"
+    echo -e "  Network Mode:     ${GREEN}${NETWORK_MODE}${NC}"
+    echo -e "  Subnet Mask:      ${GREEN}${SUBNET_MASK}${NC}"
     echo -e "  ISO URL:          ${GREEN}${ISO_URL:0:60}...${NC}"
     echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
     echo ""
@@ -748,8 +810,8 @@ XMLEOF
 create_network_script() {
     log_step "Creating Hetzner network configuration script..."
     
-    # Create the network setup script that runs on first boot
-    cat > "$MOUNT_TARGET/setup-network.cmd" << NETEOF
+    if [ "$NETWORK_MODE" = "point-to-point" ]; then
+        cat > "$MOUNT_TARGET/setup-network.cmd" << NETEOF
 @echo off
 REM ============================================================
 REM Hetzner Network Configuration for Windows Server
@@ -787,7 +849,7 @@ netsh interface ip set address name="%ADAPTER%" source=dhcp >nul 2>&1
 timeout /t 3 /nobreak >nul
 
 REM Configure static IP with /32 subnet (Hetzner point-to-point)
-netsh interface ipv4 set address name="%ADAPTER%" static ${SERVER_IP} 255.255.255.255
+netsh interface ipv4 set address name="%ADAPTER%" static ${SERVER_IP} ${SUBNET_MASK}
 
 REM Add gateway route (Hetzner requires the gateway to be added as a /32 route first)
 netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" ${GATEWAY}
@@ -810,14 +872,58 @@ netsh advfirewall firewall add rule name="Allow ICMPv4" protocol=icmpv4 dir=in a
 netsh advfirewall firewall add rule name="Allow ICMPv6" protocol=icmpv6 dir=in action=allow >nul 2>&1
 
 echo Network configuration applied.
-echo IP: ${SERVER_IP}/32
+echo IP: ${SERVER_IP}/${SUBNET_PREFIX}
 echo Gateway: ${GATEWAY}
 echo DNS: ${DNS_PRIMARY}, ${DNS_SECONDARY}
 
 REM Log the configuration
-echo %date% %time% - Network configured: ${SERVER_IP}/32 via ${GATEWAY} >> C:\hetzner-setup.log
+echo %date% %time% - Network configured: ${SERVER_IP}/${SUBNET_PREFIX} via ${GATEWAY} >> C:\hetzner-setup.log
 
 NETEOF
+    else
+        cat > "$MOUNT_TARGET/setup-network.cmd" << NETEOF
+@echo off
+REM ============================================================
+REM Standard static IPv4 configuration for Windows Server
+REM ============================================================
+
+echo Configuring server network...
+timeout /t 10 /nobreak >nul
+
+for /f "tokens=1* delims=:" %%a in ('netsh interface show interface ^| findstr /i "Dedicated Connected"') do (
+    for /f "tokens=4" %%n in ("%%b") do set "ADAPTER=%%n"
+)
+
+if not defined ADAPTER (
+    for /f "skip=3 tokens=3,4*" %%a in ('netsh interface show interface') do (
+        if "%%a"=="Connected" (
+            set "ADAPTER=%%c"
+            goto :found
+        )
+    )
+)
+:found
+
+if not defined ADAPTER set "ADAPTER=Ethernet"
+
+echo Using adapter: %ADAPTER%
+netsh interface ip set address name="%ADAPTER%" source=dhcp >nul 2>&1
+timeout /t 3 /nobreak >nul
+
+netsh interface ipv4 set address name="%ADAPTER%" static ${SERVER_IP} ${SUBNET_MASK} ${GATEWAY} 1
+netsh interface ipv4 set dns name="%ADAPTER%" static ${DNS_PRIMARY}
+netsh interface ipv4 add dns name="%ADAPTER%" ${DNS_SECONDARY} index=2
+netsh interface ipv6 set privacy state=disabled
+netsh advfirewall firewall add rule name="Allow ICMPv4" protocol=icmpv4 dir=in action=allow >nul 2>&1
+netsh advfirewall firewall add rule name="Allow ICMPv6" protocol=icmpv6 dir=in action=allow >nul 2>&1
+
+echo Network configuration applied.
+echo IP: ${SERVER_IP}/${SUBNET_PREFIX}
+echo Gateway: ${GATEWAY}
+echo DNS: ${DNS_PRIMARY}, ${DNS_SECONDARY}
+echo %date% %time% - Network configured: ${SERVER_IP}/${SUBNET_PREFIX} via ${GATEWAY} >> C:\hetzner-setup.log
+NETEOF
+    fi
 
     log_info "Network configuration script created."
 }
@@ -922,6 +1028,9 @@ echo.
 
 set SERVER_IP=${SERVER_IP}
 set GATEWAY=${GATEWAY}
+set SUBNET_MASK=${SUBNET_MASK}
+set SUBNET_PREFIX=${SUBNET_PREFIX}
+set NETWORK_MODE=${NETWORK_MODE}
 set DNS1=${DNS_PRIMARY}
 set DNS2=${DNS_SECONDARY}
 
@@ -952,15 +1061,17 @@ echo [1/5] Resetting IP configuration...
 netsh interface ip set address name="%ADAPTER%" source=dhcp >nul 2>&1
 timeout /t 3 /nobreak >nul
 
-echo [2/5] Setting static IP (%SERVER_IP%/32)...
-netsh interface ipv4 set address name="%ADAPTER%" static %SERVER_IP% 255.255.255.255
+echo [2/5] Setting static IP (%SERVER_IP%/%SUBNET_PREFIX%)...
+netsh interface ipv4 set address name="%ADAPTER%" static %SERVER_IP% %SUBNET_MASK% %GATEWAY% 1
 
-echo [3/5] Configuring Hetzner /32 routing...
-netsh interface ipv4 add route %GATEWAY%/32 "%ADAPTER%" 0.0.0.0 metric=1 >nul 2>&1
-netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" %GATEWAY% metric=1 >nul 2>&1
-route delete 0.0.0.0 >nul 2>&1
-route add %GATEWAY% mask 255.255.255.255 0.0.0.0 >nul 2>&1
-route add 0.0.0.0 mask 0.0.0.0 %GATEWAY% >nul 2>&1
+echo [3/5] Configuring routing...
+if /I "%NETWORK_MODE%"=="point-to-point" (
+    netsh interface ipv4 add route %GATEWAY%/32 "%ADAPTER%" 0.0.0.0 metric=1 >nul 2>&1
+    netsh interface ipv4 add route 0.0.0.0/0 "%ADAPTER%" %GATEWAY% metric=1 >nul 2>&1
+    route delete 0.0.0.0 >nul 2>&1
+    route add %GATEWAY% mask 255.255.255.255 0.0.0.0 >nul 2>&1
+    route add 0.0.0.0 mask 0.0.0.0 %GATEWAY% >nul 2>&1
+)
 
 echo [4/5] Setting DNS (%DNS1%, %DNS2%)...
 netsh interface ipv4 set dns name="%ADAPTER%" static %DNS1%
@@ -1292,6 +1403,9 @@ parse_args() {
     ISO_URL="$DEFAULT_ISO_URL"
     SERVER_IP=""
     GATEWAY=""
+    SUBNET_PREFIX=""
+    SUBNET_MASK=""
+    NETWORK_MODE=""
     ADMIN_PASSWORD=""
     TARGET_DISK=""
     WORK_DISK=""
@@ -1300,6 +1414,7 @@ parse_args() {
     FORCE_BIOS=""
     SINGLE_DISK_MODE=""
     INTERACTIVE_MODE=""
+    DRY_RUN=0
     
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1325,6 +1440,8 @@ parse_args() {
                 die "--single-disk is not supported safely in this version. Use a second disk for workspace." ;;
             --interactive|-i)
                 INTERACTIVE_MODE=1; shift ;;
+            --dry-run)
+                DRY_RUN=1; SKIP_CONFIRM=1; shift ;;
             --help|-h)
                 echo "Usage: $0 [options]"
                 echo ""
@@ -1338,8 +1455,9 @@ parse_args() {
                 echo "  --skip-confirm      Skip all confirmation prompts"
                 echo "  --uefi              Force UEFI boot mode"
                 echo "  --bios              Force Legacy BIOS boot mode"
-                echo "  --single-disk       Use single-disk mode"
+                echo "  --single-disk       Not supported safely in this version"
                 echo "  --interactive, -i   Launch interactive wizard"
+                echo "  --dry-run           Validate detection and configuration only"
                 echo "  --help              Show this help"
                 exit 0
                 ;;
@@ -1360,6 +1478,7 @@ main() {
         die "This script must be run as root."
     fi
     
+    progress_step 1 "Environment"
     check_rescue_mode
     check_dependencies
     
@@ -1369,27 +1488,39 @@ main() {
     fi
     
     # Detection phase (fills in anything not already set)
+    progress_step 2 "Detection"
     detect_network
     detect_disks
     detect_boot_mode
     generate_password
     
     # Confirm before proceeding
+    progress_step 3 "Confirmation"
     confirm_settings
+
+    if [ "$DRY_RUN" = "1" ]; then
+        log_info "Dry run completed successfully. No disks were modified."
+        return
+    fi
     
     # Prepare workspace
+    progress_step 4 "Workspace"
     prepare_work_disk
     
     # Download phase
+    progress_step 5 "Downloads"
     download_iso
     download_virtio
     
     # Installation phase
+    progress_step 6 "Partitioning"
     partition_target_disk
+    progress_step 7 "Windows image"
     extract_windows
     inject_drivers
     
     # Configuration phase
+    progress_step 8 "Configuration"
     generate_unattend_xml
     create_network_script
     create_post_install_script
@@ -1398,10 +1529,12 @@ main() {
     create_winpeshl_ini
     
     # Boot setup
+    progress_step 9 "Boot setup"
     setup_bootloader
     write_boot_bcd
     
     # Finalize
+    progress_step 10 "Finalize"
     finalize_installation
     print_completion
 }
