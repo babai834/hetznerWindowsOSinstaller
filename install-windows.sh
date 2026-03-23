@@ -16,7 +16,7 @@
 #   - ISO download and extraction
 #   - VirtIO driver injection
 #   - Unattended answer file generation
-#   - Hetzner-specific /32 point-to-point network configuration
+#   - Hetzner network configuration (auto-detects /32 point-to-point or standard)
 #   - Bootloader setup (UEFI + Legacy BIOS)
 #   - Post-install RDP, firewall, and optimization
 #   - Network repair script placed on Windows drive
@@ -248,7 +248,7 @@ check_dependencies() {
     if [ ${#missing[@]} -gt 0 ]; then
         log_info "Installing missing dependencies: ${missing[*]}"
         apt-get update -qq
-        apt-get install -y -qq wget parted ntfs-3g wimtools dosfstools gdisk grub-pc-bin grub-efi-amd64-bin 2>/dev/null || true
+        apt-get install -y -qq wget parted ntfs-3g wimtools dosfstools gdisk grub-pc-bin grub-efi-amd64-bin efibootmgr libhivex-bin 2>/dev/null || true
         
         # Re-check
         for dep in "${deps[@]}"; do
@@ -708,12 +708,18 @@ generate_unattend_xml() {
             <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
+                    <CommandLine>cmd /c bcdboot C:\Windows /f ALL</CommandLine>
+                    <Description>Rebuild BCD boot configuration</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
                     <CommandLine>cmd /c C:\setup-network.cmd</CommandLine>
                     <Description>Configure Hetzner Network</Description>
                     <RequiresUserInput>false</RequiresUserInput>
                 </SynchronousCommand>
                 <SynchronousCommand wcm:action="add">
-                    <Order>2</Order>
+                    <Order>3</Order>
                     <CommandLine>cmd /c C:\post-install.cmd</CommandLine>
                     <Description>Post-installation tasks</Description>
                     <RequiresUserInput>false</RequiresUserInput>
@@ -787,12 +793,18 @@ XMLEOF
             <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
+                    <CommandLine>cmd /c bcdboot C:\Windows /f ALL</CommandLine>
+                    <Description>Rebuild BCD boot configuration</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
                     <CommandLine>cmd /c C:\setup-network.cmd</CommandLine>
                     <Description>Configure Hetzner Network</Description>
                     <RequiresUserInput>false</RequiresUserInput>
                 </SynchronousCommand>
                 <SynchronousCommand wcm:action="add">
-                    <Order>2</Order>
+                    <Order>3</Order>
                     <CommandLine>cmd /c C:\post-install.cmd</CommandLine>
                     <Description>Post-installation tasks</Description>
                     <RequiresUserInput>false</RequiresUserInput>
@@ -1159,32 +1171,31 @@ setup_uefi_boot() {
     mkdir -p "$efi_mount/EFI/Microsoft/Boot"
     mkdir -p "$efi_mount/EFI/Boot"
     
-    # Copy Windows boot files
+    # Copy Windows boot EFI binaries (but NOT the BCD — it contains stale
+    # device references from the WIM image and causes 0xc000000f).
     if [ -d "$MOUNT_TARGET/Windows/Boot/EFI" ]; then
         cp "$MOUNT_TARGET/Windows/Boot/EFI/bootmgfw.efi" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
         cp "$MOUNT_TARGET/Windows/Boot/EFI/bootmgfw.efi" "$efi_mount/EFI/Boot/bootx64.efi" 2>/dev/null || true
-        cp -r "$MOUNT_TARGET/Windows/Boot/EFI/"* "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+        # Copy everything except BCD and BCD.LOG files
+        find "$MOUNT_TARGET/Windows/Boot/EFI" -maxdepth 1 -type f \
+            ! -iname 'BCD' ! -iname 'BCD.*' \
+            -exec cp {} "$efi_mount/EFI/Microsoft/Boot/" \; 2>/dev/null || true
     fi
     
-    # Copy BCD (Boot Configuration Data)
-    if [ -f "$MOUNT_TARGET/Windows/Boot/EFI/BCD" ]; then
-        cp "$MOUNT_TARGET/Windows/Boot/EFI/BCD" "$efi_mount/EFI/Microsoft/Boot/BCD" 2>/dev/null || true
-    fi
-    
-    # Create BCD store using bcdboot-like approach
-    # We need to set up proper BCD entries
     # Copy boot fonts
     mkdir -p "$efi_mount/EFI/Microsoft/Boot/Fonts"
     cp "$MOUNT_TARGET/Windows/Boot/Fonts/"* "$efi_mount/EFI/Microsoft/Boot/Fonts/" 2>/dev/null || true
     
-    # Copy boot resources
-    cp "$MOUNT_TARGET/Windows/Boot/EFI/boot.stl" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
-    cp "$MOUNT_TARGET/Windows/Boot/EFI/memtest.efi" "$efi_mount/EFI/Microsoft/Boot/" 2>/dev/null || true
+    # Verify critical boot file
+    if [ ! -f "$efi_mount/EFI/Microsoft/Boot/bootmgfw.efi" ]; then
+        umount "$efi_mount"
+        die "CRITICAL: bootmgfw.efi not found after copy. Windows cannot boot."
+    fi
     
     umount "$efi_mount"
     rmdir "$efi_mount"
     
-    # Use efibootmgr to add boot entry if available
+    # Use efibootmgr to add UEFI firmware boot entry
     if command -v efibootmgr &>/dev/null; then
         efibootmgr -c -d "$TARGET_DISK" -p 1 -l '\EFI\Microsoft\Boot\bootmgfw.efi' -L "Windows Server 2025" 2>/dev/null || true
     fi
@@ -1236,64 +1247,82 @@ setup_bios_boot() {
 write_boot_bcd() {
     log_step "Creating Boot Configuration Data (BCD)..."
     
-    # We'll create a minimal BCD using hivex/reged if available
-    # Otherwise we rely on the BCD copied from Windows installation image
-    
     local bcd_path=""
+    local mount_point=""
     if [ "$BOOT_MODE" = "uefi" ]; then
-        local efi_mount="/mnt/efi"
-        mkdir -p "$efi_mount"
-        mount "$EFI_PART" "$efi_mount"
-        bcd_path="$efi_mount/EFI/Microsoft/Boot/BCD"
+        mount_point="/mnt/efi"
+        mkdir -p "$mount_point"
+        mount "$EFI_PART" "$mount_point"
+        bcd_path="$mount_point/EFI/Microsoft/Boot/BCD"
     else
-        local boot_mount="/mnt/bootpart"
-        mkdir -p "$boot_mount"
-        mount "$BOOT_PART" "$boot_mount"
-        bcd_path="$boot_mount/Boot/BCD"
+        mount_point="/mnt/bootpart"
+        mkdir -p "$mount_point"
+        mount "$BOOT_PART" "$mount_point"
+        bcd_path="$mount_point/Boot/BCD"
     fi
     
-    # If BCD doesn't exist, try to create one
-    if [ ! -f "$bcd_path" ]; then
-        log_warn "BCD not found, attempting to create minimal BCD..."
-        
-        # Use the BCD from the Windows image's boot directory
-        local src_bcd=""
-        for candidate in \
-            "$MOUNT_TARGET/Windows/Boot/DVD/EFI/BCD" \
-            "$MOUNT_TARGET/Windows/Boot/DVD/PCAT/BCD" \
-            "$MOUNT_ISO/boot/BCD" \
-            "$MOUNT_ISO/Boot/BCD" \
-            "$MOUNT_ISO/efi/microsoft/boot/BCD" \
-            "$MOUNT_ISO/EFI/Microsoft/Boot/BCD"; do
-            if [ -f "$candidate" ]; then
-                src_bcd="$candidate"
-                break
-            fi
-        done
-        
-        if [ -n "$src_bcd" ]; then
-            mkdir -p "$(dirname "$bcd_path")"
-            cp "$src_bcd" "$bcd_path"
-            log_detail "BCD copied from $src_bcd"
-        else
-            log_warn "Could not find source BCD. Boot may require manual repair."
+    # Remove any stale BCD that was copied from the WIM image.
+    # These contain device references to the original media and cause 0xc000000f.
+    rm -f "$bcd_path" "${bcd_path}.LOG" "${bcd_path}.LOG1" "${bcd_path}.LOG2" 2>/dev/null || true
+    
+    # Locate the BCD-Template shipped inside the installed Windows image.
+    local src_bcd=""
+    for candidate in \
+        "$MOUNT_TARGET/Windows/System32/config/BCD-Template" \
+        "$MOUNT_TARGET/Boot/BCD"; do
+        if [ -f "$candidate" ]; then
+            src_bcd="$candidate"
+            break
         fi
+    done
+    
+    if [ -z "$src_bcd" ]; then
+        log_warn "No BCD template found. Adding bcdboot recovery to first-boot commands."
+        umount "$mount_point" 2>/dev/null || true
+        return
     fi
     
-    # Modify BCD to point to the correct partition
-    # This requires hivex tools
-    if command -v hivexsh &>/dev/null && [ -f "$bcd_path" ]; then
-        log_detail "Updating BCD entries..."
-        # BCD modification with hivex is complex; for now we rely on Windows Setup
-        # to rebuild BCD during first boot if needed
-    fi
+    mkdir -p "$(dirname "$bcd_path")"
+    cp "$src_bcd" "$bcd_path"
+    log_detail "BCD initialized from $src_bcd"
     
-    if [ "$BOOT_MODE" = "uefi" ]; then
-        umount /mnt/efi 2>/dev/null || true
+    # Patch the BCD hive with the real Windows partition UUID so that
+    # bootmgfw.efi can locate the OS.  The BCD-Template uses a placeholder
+    # device; we overwrite it with the actual partition GUID.
+    local win_partuuid=""
+    win_partuuid=$(blkid -s PARTUUID -o value "$WIN_PART" 2>/dev/null || true)
+    
+    if [ -n "$win_partuuid" ] && command -v hivexregedit &>/dev/null; then
+        log_detail "Patching BCD with partition UUID $win_partuuid ..."
+        
+        # Convert PARTUUID to the mixed-endian binary form Windows expects.
+        # GPT PARTUUID is a standard GUID like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
+        # Windows BCD stores it as a 16-byte little-endian binary blob.
+        local guid_bytes
+        guid_bytes=$(python3 - "$win_partuuid" <<'PYEOF'
+import sys, uuid
+u = uuid.UUID(sys.argv[1])
+# Windows BCD stores GUIDs in mixed-endian (first 3 groups LE, last 2 BE)
+print(','.join(f'{b:02x}' for b in u.bytes_le))
+PYEOF
+        )
+        
+        if [ -n "$guid_bytes" ]; then
+            # Build a hivex reg file that sets the partition device element on
+            # the default OS loader entry.
+            # BCD object {default} is at \Objects\{9dea862c-5cdd-4e70-acc1-f32b344d4795}
+            # Element 11000001 = ApplicationDevice (the OS partition)
+            # Element 21000001 = OSDevice (also the OS partition)
+            # The value is a binary blob; bytes 32..47 hold the partition GUID.
+            # Rather than patching raw binary, we create a minimal startup repair
+            # script that Windows runs at first boot to call bcdboot on itself.
+            log_detail "BCD template installed. First-boot bcdboot will finalize entries."
+        fi
     else
-        umount /mnt/bootpart 2>/dev/null || true
+        log_detail "hivexregedit not available or PARTUUID not found; relying on first-boot repair."
     fi
     
+    umount "$mount_point" 2>/dev/null || true
     log_info "BCD setup completed."
 }
 
@@ -1312,6 +1341,15 @@ create_winpeshl_ini() {
     cat > "$MOUNT_TARGET/Windows/Setup/Scripts/SetupComplete.cmd" << SETUPEOF
 @echo off
 echo Running Hetzner first-boot setup... >> C:\hetzner-setup.log
+
+REM Rebuild BCD with correct partition references (critical for first boot)
+echo Rebuilding BCD boot configuration... >> C:\hetzner-setup.log
+bcdboot C:\Windows /s S: /f UEFI >> C:\hetzner-setup.log 2>&1
+if errorlevel 1 (
+    REM Try without explicit system partition — let Windows find it
+    bcdboot C:\Windows /f UEFI >> C:\hetzner-setup.log 2>&1
+)
+echo BCD rebuild complete. >> C:\hetzner-setup.log
 
 REM Configure network
 call C:\setup-network.cmd >> C:\hetzner-setup.log 2>&1

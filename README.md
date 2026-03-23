@@ -184,10 +184,26 @@ All handled automatically. If network fails post-install, open KVM console and r
 ### Windows stuck at "Getting ready"
 - Normal for first boot — can take 10-15 minutes
 
-### Boot failure after install
-- Reboot into rescue mode
-- Check: `mount /dev/sda3 /mnt && ls /mnt/Windows/`
-- For UEFI: verify `/EFI/Microsoft/Boot/bootmgfw.efi` exists on EFI partition
+### Boot failure (0xc000000f) after install
+This means the BCD boot configuration has stale device references. Fix via KVM:
+1. Mount the Windows Server ISO in Hetzner KVM virtual media
+2. Boot from the ISO → **Repair your computer** → **Command Prompt**
+3. Run:
+   ```bat
+   diskpart
+   list vol
+   ```
+4. Identify the EFI partition (small FAT32) and the Windows partition (large NTFS)
+5. Assign drive letters and rebuild:
+   ```bat
+   select volume <EFI_VOL>
+   assign letter=S
+   select volume <WIN_VOL>
+   assign letter=C
+   exit
+   bcdboot C:\Windows /s S: /f UEFI
+   ```
+6. Detach the ISO and reboot
 
 ### Only one disk available
 - This version does not support single-disk installs safely
