@@ -36,15 +36,15 @@ echo ""
 read -rp "Administrator password (leave empty for auto-generated): " ADMIN_PASS
 echo ""
 
-# Build command
-CMD="bash $INSTALLER --ip $SERVER_IP"
+# Build command as an array to avoid word-splitting / injection via eval
+CMD=("bash" "$INSTALLER" "--ip" "$SERVER_IP")
 
 if [ -n "${ADMIN_PASS:-}" ]; then
-    CMD="$CMD --password '$ADMIN_PASS'"
+    CMD+=("--password" "$ADMIN_PASS")
 fi
 
-echo "Running: $CMD"
+echo "Running: bash $INSTALLER --ip $SERVER_IP${ADMIN_PASS:+ --password <hidden>}"
 echo ""
 
 # Execute
-eval "$CMD"
+"${CMD[@]}"

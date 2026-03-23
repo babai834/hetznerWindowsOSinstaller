@@ -82,6 +82,21 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()    { echo -e "${CYAN}[STEP]${NC} $*"; }
 log_detail()  { echo -e "${BLUE}  →${NC} $*"; }
 
+# download_file <url> <dest>
+# Downloads a file using wget (preferred) or curl as fallback.
+# Returns non-zero on failure.
+download_file() {
+    local url="$1" dest="$2"
+    if command -v wget &>/dev/null; then
+        wget -O "$dest" "$url" --progress=bar:force:noscroll 2>&1
+    elif command -v curl &>/dev/null; then
+        curl -fL --progress-bar -o "$dest" "$url"
+    else
+        log_error "Neither wget nor curl is available."
+        return 1
+    fi
+}
+
 TOTAL_STEPS=10
 
 progress_step() {
@@ -161,9 +176,9 @@ cleanup() {
         umount /mnt/efi 2>/dev/null || true
         umount /mnt/bootpart 2>/dev/null || true
     fi
-    [ -d "$MOUNT_ISO" ] && rmdir "$MOUNT_ISO" 2>/dev/null || true
-    [ -d "$MOUNT_WORK" ] && rmdir "$MOUNT_WORK" 2>/dev/null || true
-    [ -d "$MOUNT_TARGET" ] && rmdir "$MOUNT_TARGET" 2>/dev/null || true
+    if [ -d "$MOUNT_ISO" ]; then rmdir "$MOUNT_ISO" 2>/dev/null || true; fi
+    if [ -d "$MOUNT_WORK" ]; then rmdir "$MOUNT_WORK" 2>/dev/null || true; fi
+    if [ -d "$MOUNT_TARGET" ]; then rmdir "$MOUNT_TARGET" 2>/dev/null || true; fi
 }
 
 die() {
@@ -483,8 +498,7 @@ download_iso() {
     log_detail "URL: $ISO_URL"
     log_detail "This may take 10-20 minutes depending on network speed..."
     
-    wget -O "$iso_path" "$ISO_URL" \
-        --progress=bar:force:noscroll 2>&1 || die "Failed to download ISO"
+    download_file "$ISO_URL" "$iso_path" || die "Failed to download ISO"
     
     local final_size
     final_size=$(stat -c%s "$iso_path")
@@ -511,8 +525,7 @@ download_virtio() {
         fi
     fi
     
-    wget -O "$virtio_path" "$VIRTIO_ISO_URL" \
-        --progress=bar:force:noscroll 2>&1 || {
+    download_file "$VIRTIO_ISO_URL" "$virtio_path" || {
         log_warn "VirtIO download failed. Continuing without VirtIO drivers."
         log_warn "This is fine for most Hetzner hardware (non-KVM)."
         VIRTIO_PATH=""
@@ -1488,11 +1501,11 @@ main() {
     print_completion
 }
 
-# Parse command line arguments
-parse_args "$@"
-
 # Set up trap for cleanup on error
 trap cleanup EXIT
+
+# Parse command line arguments
+parse_args "$@"
 
 # Run main
 main

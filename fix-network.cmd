@@ -16,9 +16,14 @@ set DNS2=185.12.64.2
 
 REM Auto-detect gateway if not set
 if "%GATEWAY%"=="" (
-    REM Hetzner gateways are typically the IP with last octet as .1
-    REM But for /32 routing, the gateway is provided separately
-    REM Common Hetzner gateway patterns:
+    REM Try to read the current default gateway from the routing table
+    for /f "tokens=3" %%g in ('route print 0.0.0.0 ^| findstr /r "^ *0\.0\.0\.0"') do (
+        if not defined GATEWAY set "GATEWAY=%%g"
+    )
+)
+
+REM Final fallback: derive gateway from server IP (last octet -> .1)
+if "%GATEWAY%"=="" (
     for /f "tokens=1-3 delims=." %%a in ("%SERVER_IP%") do (
         set GATEWAY=%%a.%%b.%%c.1
     )

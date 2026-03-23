@@ -221,8 +221,4 @@ This means the BCD boot configuration has stale device references. Fix via KVM:
 
 ## License
 
-MIT License. See source for details.
-
-## License
-
 Custom deployment tool. Windows Server is used under Microsoft's evaluation terms (180-day trial). A license key is required for production use.
